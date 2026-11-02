@@ -41,12 +41,35 @@ pub fn percentiles(samples: &[f64]) -> (f64, f64) {
     (at(0.50), at(0.99))
 }
 
+/// Consecutive repeated frames after which the source is declared
+/// frozen. One repeat can be a genuinely static camera view racing
+/// its own cadence; two in a row at watch cadences means the image
+/// has stopped changing while the poller has not (gap G1).
+pub const FROZEN_AFTER_REPEATS: u64 = 2;
+
+/// What one frame's freshness observation did to the source state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshnessTransition {
+    None,
+    BecameFrozen,
+    Recovered,
+}
+
 /// Running counters + windows the ledger files are rendered from.
 #[derive(Debug, Default, Clone)]
 pub struct Stats {
     pub frames_seen: u64,
     pub frames_changed: u64,
     pub events_published: u64,
+    /// Frames whose image differed from the previous frame's
+    /// (freshness by novelty — gap G1). A live source, however
+    /// quiet the scene, produces novel frames (sensor noise
+    /// alone guarantees it); a frozen source cannot.
+    pub frames_novel: u64,
+    /// Frames byte-identical (by ingest hash) to the previous one.
+    pub frames_repeated: u64,
+    /// Current run of consecutive repeated frames.
+    pub consecutive_repeats: u64,
     pub tiles_nominated: u64,
     pub tiles_embedded: u64,
     pub embeds_spent_s: f64,
@@ -73,6 +96,23 @@ impl Stats {
     /// saving against.
     pub fn embed_everything_estimate_s(&self) -> f64 {
         self.frames_seen as f64 * 16.0 * self.mean_embed_ms() / 1000.0
+    }
+    /// The source is frozen when the last `FROZEN_AFTER_REPEATS`
+    /// frames were all repeats of one image.
+    pub fn source_frozen(&self) -> bool {
+        self.consecutive_repeats >= FROZEN_AFTER_REPEATS
+    }
+    /// `live` / `frozen` / `unknown`. Unknown means no freshness
+    /// data has arrived at all (an ingest too old to stamp
+    /// hashes) — reported as its own state, never as live.
+    pub fn freshness(&self) -> &'static str {
+        if self.frames_novel == 0 && self.frames_repeated == 0 {
+            "unknown"
+        } else if self.source_frozen() {
+            "frozen"
+        } else {
+            "live"
+        }
     }
     pub fn coverage(&self) -> f64 {
         if self.tiles_nominated == 0 {
@@ -232,6 +272,29 @@ impl Ledger {
         Ok(latency_ms)
     }
 
+    /// Observe one frame's freshness (gap G1): `repeated` is true
+    /// when the frame's image is identical to the previous frame's
+    /// (the ingest stamps a hash per frame and flags repeats).
+    /// Returns the state transition, if any, so the caller can
+    /// receipt it. This is the counter the frozen soak feed could
+    /// not move: polls are not freshness; novelty is.
+    pub fn observe_freshness(&mut self, repeated: bool) -> FreshnessTransition {
+        let was_frozen = self.stats.source_frozen();
+        if repeated {
+            self.stats.frames_repeated += 1;
+            self.stats.consecutive_repeats += 1;
+        } else {
+            self.stats.frames_novel += 1;
+            self.stats.consecutive_repeats = 0;
+        }
+        let is_frozen = self.stats.source_frozen();
+        match (was_frozen, is_frozen) {
+            (false, true) => FreshnessTransition::BecameFrozen,
+            (true, false) => FreshnessTransition::Recovered,
+            _ => FreshnessTransition::None,
+        }
+    }
+
     /// Observe a frame-arrival interval for the lens rhythm stats.
     pub fn observe_period(&mut self, period_ms: f64) {
         let s = &mut self.stats;
@@ -290,6 +353,9 @@ impl Ledger {
         let mut t = String::new();
         t.push_str(&format!("stream_id = {}\n", self.stream_id));
         t.push_str(&format!("frames_seen = {}\n", s.frames_seen));
+        t.push_str(&format!("frames_novel = {}\n", s.frames_novel));
+        t.push_str(&format!("frames_repeated = {}\n", s.frames_repeated));
+        t.push_str(&format!("freshness = {}\n", s.freshness()));
         t.push_str(&format!("frames_changed = {}\n", s.frames_changed));
         t.push_str(&format!("events_published = {}\n", s.events_published));
         t.push_str(&format!(
@@ -337,16 +403,23 @@ impl Ledger {
             epoch_us().saturating_sub(s.last_frame_wall_us) as f64 / 1000.0
         };
         format!(
-            "embed_ms_p50 = {:.2}\nembed_ms_p99 = {:.2}\nembed_ms_n = {}\nframes_pending_max = {}\nlast_frame_age_ms = {:.1}\nembedder = {}\nsilence_meaningful = {}\nupdated_wall_us = {}\n",
+            "embed_ms_p50 = {:.2}\nembed_ms_p99 = {:.2}\nembed_ms_n = {}\nframes_pending_max = {}\nlast_frame_age_ms = {:.1}\nembedder = {}\nfreshness = {}\nframes_novel = {}\nframes_repeated = {}\nconsecutive_repeats = {}\nsilence_meaningful = {}\nupdated_wall_us = {}\n",
             p50,
             p99,
             s.embed_ms_window.len(),
             s.frames_pending_max,
             age_ms,
             if self.embedder_up { "up" } else { "down" },
+            s.freshness(),
+            s.frames_novel,
+            s.frames_repeated,
+            s.consecutive_repeats,
             // Panel-1 amendment: silence is only "normal" when health
-            // says so — a starved lane must not look calm.
-            self.embedder_up && s.frames_seen > 0,
+            // says so — a starved lane must not look calm. Gap G1
+            // amendment: a *frozen* lane must not look calm either —
+            // polls arriving is not evidence of life; image novelty
+            // is. (13 h of the 2026-11 soak were counted this way.)
+            self.embedder_up && s.frames_seen > 0 && !s.source_frozen(),
             epoch_us()
         )
     }

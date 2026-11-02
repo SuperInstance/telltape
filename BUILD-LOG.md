@@ -94,6 +94,46 @@ Slice-1 verification (this machine, debug build):
   = exactly {5,6}, drift silent, lineage 31, spend ratio
   **0.1181** — the plan §5 P3 numbers, reproduced cold.
 
+## Slice 2 — G1: freshness by novelty (2026-11-02, continuation)
+
+The defect, from the origin record (plan §7 G1 / §8 E3): in the
+live soak the camera pusher died and the watch polled the
+receiver's last frame for ~13 h, counting polls as frames while
+`health.txt` claimed `silence_meaningful = true` — `frames_seen`
+was a poll counter and `last_frame_age_ms` measured the poll,
+not the image.
+
+- Slice 1 already made the ingest stamp every `frame_end` with
+  `frame_hash` (SHA-256 over a 32×32 downsample) and
+  `frame_repeat` (identical to the previous frame). This slice
+  makes the Rust side *consume* them.
+- `ledger.rs`: `Stats` gains `frames_novel`, `frames_repeated`,
+  `consecutive_repeats`; `Ledger::observe_freshness(repeated)`
+  returns the transition (`BecameFrozen` / `Recovered` / none).
+  Frozen = **2 consecutive repeats** — one repeat can be a
+  static view racing its cadence; a real camera's sensor noise
+  makes two identical consecutive frames a dead source, not a
+  quiet scene. `health.txt` and `state.txt` now carry
+  `freshness = live | frozen | unknown` (unknown = an ingest
+  too old to stamp hashes — its own state, never dressed as
+  live), the novelty counters, and `silence_meaningful` now
+  requires `!source_frozen()` on top of the Panel-1 conditions.
+- `service.rs`: per frame_end, repeated = the ingest's
+  `frame_repeat` flag when present, else our own hash
+  comparison, else (no stamps at all) novel-with-unknown-basis.
+  Transitions are receipted as `source_frozen` /
+  `source_recovered` service events, so the ledger narrates the
+  incident itself.
+- **P6 regression test** (`tests/live.rs::
+  frozen_source_reads_frozen_not_meaningful_silence`): frame 0
+  real, frames 1–5 record-free with one unchanging hash. The
+  run still counts 6 frames (polls counted as polls) and 0
+  events — and health reads `freshness = frozen`,
+  `silence_meaningful = false`, `frames_repeated = 5`.
+
+Verification: `cargo test --workspace` — **67 passed, 0
+failed** (66 inherited + P6).
+
 ## Naming decision — telltape (2026-11-02)
 
 Casey delegated the name pick to Muse; decided the same day:

@@ -11,21 +11,18 @@
 //!    cut published as an event, rack lifecycle untouched (we did
 //!    not start it, so we must not stop it).
 
-use telltape::config::Config;
-use telltape::ledger::Ledger;
-use telltape::live::LivePipeline;
-use telltape::service;
 use harbor_watch::fixture;
 use harbor_watch::pipeline::{run_records, Config as PipeConfig};
 use harbor_watch::record::record_to_json;
 use std::collections::BTreeMap;
 use std::io::Write;
+use telltape::config::Config;
+use telltape::ledger::Ledger;
+use telltape::live::LivePipeline;
+use telltape::service;
 
 fn tempdir(tag: &str) -> String {
-    let d = std::env::temp_dir().join(format!(
-        "telltape-test-{tag}-{}",
-        std::process::id()
-    ));
+    let d = std::env::temp_dir().join(format!("telltape-test-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d.to_string_lossy().to_string()
@@ -121,6 +118,61 @@ fn ledger_files_and_lineage() {
         "{}",
         verdicts[0]
     );
+}
+
+/// P6 / gap G1 — the frozen-source regression. The 2026-11 soak
+/// failure as a fixture: the camera pusher died, the receiver kept
+/// serving its last frame, and the watch counted polls as frames
+/// for ~13 h while health claimed the silence was meaningful.
+/// Here: frame 0 is real (fixture records); frames 1..=5 deliver
+/// NO records and stamp `frame_repeat: true` with one unchanging
+/// hash — exactly what a frozen feed looks like at this interface.
+/// The ledger must call it frozen and withdraw meaning from the
+/// silence, while still counting the frames honestly.
+#[test]
+fn frozen_source_reads_frozen_not_meaningful_silence() {
+    let fx = fixture::generate(128, 7);
+    let dir = tempdir("frozen");
+    let recs_path = format!("{dir}/records.jsonl");
+    let now = telltape::ledger::epoch_us();
+    {
+        let mut f = std::fs::File::create(&recs_path).unwrap();
+        for r in fx.records.iter().filter(|r| r.frame == 0) {
+            writeln!(f, "{}", record_to_json(r)).unwrap();
+        }
+        writeln!(
+            f,
+            "{{\"control\":\"frame_end\",\"frame\":0,\"t_capture_us\":{now},\"nominated\":16,\"gate_diff\":3.0,\"frame_hash\":\"aaaa0000\",\"frame_repeat\":false}}"
+        )
+        .unwrap();
+        for frame in 1..=5u32 {
+            writeln!(
+                f,
+                "{{\"control\":\"frame_end\",\"frame\":{frame},\"t_capture_us\":{now},\"nominated\":0,\"gate_diff\":3.0,\"frame_hash\":\"aaaa0000\",\"frame_repeat\":true}}"
+            )
+            .unwrap();
+        }
+    }
+    let cfg = Config {
+        stream_id: "frozen-stream".into(),
+        ledger_dir: format!("{dir}/ledger"),
+        ingest_cmd: format!("cat {recs_path}"),
+        embed_url: String::new(),
+        max_frames: 6,
+        ..Config::default()
+    };
+    let summary = service::run(&cfg).expect("service run");
+    assert_eq!(summary.frames, 6, "polls still counted — as polls");
+    assert_eq!(summary.events, 0);
+    let health = std::fs::read_to_string(format!("{dir}/ledger/health.txt")).unwrap();
+    assert!(health.contains("freshness = frozen"), "{health}");
+    assert!(health.contains("silence_meaningful = false"), "{health}");
+    assert!(health.contains("frames_repeated = 5"), "{health}");
+    assert!(health.contains("frames_novel = 1"), "{health}");
+    let state = std::fs::read_to_string(format!("{dir}/ledger/state.txt")).unwrap();
+    assert!(state.contains("freshness = frozen"), "{state}");
+    let events = std::fs::read_to_string(format!("{dir}/ledger/events.jsonl")).unwrap();
+    assert!(events.contains("source_frozen"), "{events}");
 }
 
 /// A one-shot HTTP responder that answers 200 to everything: stands

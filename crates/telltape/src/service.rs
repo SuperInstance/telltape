@@ -8,7 +8,10 @@
 //! field the ingest stamps with the embedder call's measured latency.
 //! Frame boundaries are control lines:
 //! `{"control":"frame_end","frame":N,"t_capture_us":<epoch µs>,
-//!   "nominated":K,"gate_diff":G}`.
+//!   "nominated":K,"gate_diff":G,"frame_hash":H,"frame_repeat":B}`.
+//! The hash/repeat stamps are how freshness is proven (gap G1):
+//! a source that keeps delivering the same image is *frozen*, and
+//! health says so — it never reads as meaningful silence.
 //!
 //! Embedder lifecycle (extraction surgery, plan §2.2): the origin
 //! tool hardcoded the fleet's JEV rack — a systemctl start/stop of a
@@ -57,6 +60,35 @@ fn json_num(line: &str, key: &str) -> Option<f64> {
         .find(|c: char| c == ',' || c == '}' || c.is_whitespace())
         .unwrap_or(rest.len());
     rest[..end].parse::<f64>().ok()
+}
+
+/// Extract a string field from a JSON line (same deliberately
+/// small approach). Returns the unquoted contents.
+fn json_str(line: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let at = line.find(&pat)?;
+    let rest = &line[at + pat.len()..];
+    let colon = rest.find(':')?;
+    let rest = rest[colon + 1..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Extract a boolean field from a JSON line.
+fn json_bool(line: &str, key: &str) -> Option<bool> {
+    let pat = format!("\"{key}\"");
+    let at = line.find(&pat)?;
+    let rest = &line[at + pat.len()..];
+    let colon = rest.find(':')?;
+    let rest = rest[colon + 1..].trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// Minimal HTTP/1.0 GET on a raw socket: enough for a health
@@ -185,6 +217,7 @@ pub fn run(cfg: &Config) -> Result<Summary, String> {
         focus_k: cfg.focus_k,
     };
     let mut pipeline: Option<LivePipeline> = None;
+    let mut prev_frame_hash: Option<String> = None;
     let mut pending: Vec<InputRecord> = Vec::new();
     let mut pending_embed_ms: Vec<f64> = Vec::new();
     let mut last_frame_wall: Option<std::time::Instant> = None;
@@ -215,6 +248,50 @@ pub fn run(cfg: &Config) -> Result<Summary, String> {
                     ledger.gate_diff = Some(g);
                 }
                 frames_received += 1;
+                // Freshness (gap G1): the ingest stamps each frame
+                // with a hash of its image and a repeat flag. A
+                // frame whose image is identical to the previous
+                // one is a *repeat* — the poll succeeded but nothing
+                // was seen. Trust the flag when present; fall back
+                // to comparing hashes ourselves when it is not; a
+                // frame with neither stamp (an old ingest) cannot
+                // be judged and counts as novel, with health
+                // reporting freshness = unknown until judged data
+                // arrives.
+                let frame_hash = json_str(line, "frame_hash");
+                let repeated = match (
+                    json_bool(line, "frame_repeat"),
+                    &frame_hash,
+                    &prev_frame_hash,
+                ) {
+                    (Some(r), _, _) => r,
+                    (None, Some(h), Some(p)) => h == p,
+                    _ => false,
+                };
+                if frame_hash.is_some() {
+                    prev_frame_hash = frame_hash;
+                }
+                match ledger.observe_freshness(repeated) {
+                    crate::ledger::FreshnessTransition::BecameFrozen => {
+                        eprintln!("[telltape] source frozen: repeated frames, silence no longer meaningful");
+                        ledger
+                            .service_event(
+                                "source_frozen",
+                                "frame image stopped changing while polls continue; silence_meaningful = false",
+                            )
+                            .ok();
+                    }
+                    crate::ledger::FreshnessTransition::Recovered => {
+                        eprintln!("[telltape] source live again: novel frames arriving");
+                        ledger
+                            .service_event(
+                                "source_recovered",
+                                "novel frames arriving again after a frozen stretch",
+                            )
+                            .ok();
+                    }
+                    crate::ledger::FreshnessTransition::None => {}
+                }
                 // Lens rhythm: wall interval between frame arrivals.
                 let now = std::time::Instant::now();
                 if let Some(prev) = last_frame_wall {
