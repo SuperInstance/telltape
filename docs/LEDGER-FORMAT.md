@@ -34,17 +34,62 @@ change (silence is the default state of the file):
 **Service row** — lifecycle receipts:
 `{"kind":"service","event":…,"msg":…,"wall_us":…}`. Events
 include `start`, `stop`, `embedder`, `embedder_start`,
-`embedder_stop`, and the freshness receipts `source_frozen` /
-`source_recovered` (see health.txt).
+`embedder_stop`, the freshness receipts `source_frozen` /
+`source_recovered` (see health.txt), and `embedder_swap`
+(see "Embedder identity and the swap rule" below).
+
+## Embedder identity and the swap rule
+
+Every ledger records **which embedder produced its tells**:
+`embedder_identity` (`name@version`, the bare name when no
+version is declared, or `unknown` when the operator declared
+none) appears in lens.txt, state.txt and health.txt. The
+identity comes from the config keys `embedder_name` /
+`embedder_version`; the `index` verb derives it from the
+adapter its own config selects when those keys are unset —
+`double@1` for the built-in test double (it reports itself
+honestly as the double), `http@<endpoint URL>` for the
+generic HTTP adapter (the URL is the only version a generic
+endpoint has).
+
+This exists because the width guard is not enough (deficit
+D1): two embedders of the *same width* still live in
+different embedding spaces — related by at best a rotation —
+so per-tile baselines, the gate calibration, and the
+comparability of verdict rows across time are all defined
+only *within* one identity. The rule, enforced at open,
+before anything is written:
+
+- Same identity as recorded → ordinary resume.
+- **Different identity → typed refusal** naming both
+  identities. The run writes nothing. To accept the swap,
+  the operator sets `recalibrate = true` in the config (or
+  passes `--recalibrate`): the run then proceeds with fresh
+  baselines and receipts the swap as an `embedder_swap`
+  service row naming the old and new identities — a swap is
+  a lens change, and the event stream fences the verdicts
+  written before it from those written after. Silent
+  continuation on old baselines is impossible.
+
+**Migration — pre-0.1.1 ledgers.** A ledger written before
+embedder identity existed has no `embedder_identity` line;
+its embedder reads as *unknown*, never as "probably the
+same one". Opening such a ledger under any configuration —
+including an undeclared (`unknown`) one — requires the same
+explicit recalibrate acknowledgement, once. The run then
+receipts the stamping as an `embedder_swap` from
+`unknown (pre-0.1.1 ledger: no embedder identity recorded)`
+and the ledger carries a recorded identity from then on.
 
 ## lens.txt — the stream's learned normal
 
 `key = value` lines: `stream_id`; **`grid`** (`RxC` — the
 geometry every tile number in this ledger is read against);
-`period_ms` / `jitter_ms` (frame-arrival rhythm EMAs, or
-`unknown`); `threshold`; `alpha`; `gate_diff` (when the ingest
-reported one); `frames_observed`; `tile_score_ema`
-(space-separated per-tile score EMAs, `null` = never scored).
+**`embedder_identity`** (see above); `period_ms` / `jitter_ms`
+(frame-arrival rhythm EMAs, or `unknown`); `threshold`;
+`alpha`; `gate_diff` (when the ingest reported one);
+`frames_observed`; `tile_score_ema` (space-separated per-tile
+score EMAs, `null` = never scored).
 
 ## state.txt — counters and the budget meter
 
@@ -54,7 +99,7 @@ reported one); `frames_observed`; `tile_score_ema`
 (embedded ÷ nominated), `embeds_spent_s`,
 `embed_everything_estimate_s` (what ungated watching would
 have cost at the observed embed latency and this grid),
-`spend_ratio`, `embedder` (`up`/`down`),
+`spend_ratio`, `embedder` (`up`/`down`), `embedder_identity`,
 `embedder_started_by_me`, `soak`, `updated_wall_us`.
 
 In soak mode (`soak = true`) state.txt additionally carries,
@@ -82,6 +127,8 @@ what makes quiet meaningful — or says it isn't:
 - `last_frame_age_ms` — wall time since the last frame was
   recorded (−1.0 before any frame).
 - `embedder` — `up` / `down`.
+- `embedder_identity` — the embedder that produced this
+  ledger's tells (see "Embedder identity and the swap rule").
 - **`freshness`** — `live` / `frozen` / `unknown`. Freshness is
   proven by *image novelty*: the ingest hashes each frame, and
   a frame identical to its predecessor is a repeat. `frozen` =

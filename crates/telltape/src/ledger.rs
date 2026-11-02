@@ -3,6 +3,7 @@
 //! ```text
 //! <ledger_dir>/
 //!   lens.txt      rhythm (period/jitter EMA) + appearance baseline
+//!                 + the embedder identity the tells belong to
 //!   state.txt     current state + budget meter + coverage counters
 //!   events.jsonl  append-only: service receipts + published verdicts
 //!   health.txt    Panel-1 heartbeat: embed p50/p99, queue, frame age
@@ -135,6 +136,25 @@ impl Stats {
     }
 }
 
+/// What a ledger directory already on disk says about the
+/// embedder that wrote it (deficit D1). Probed *before* opening:
+/// opening rewrites lens.txt, so the recorded identity must be
+/// read first or the evidence of a swap is destroyed by the
+/// act of looking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedIdentity {
+    /// No ledger here yet (no lens.txt, no events): a new ledger
+    /// takes the configured identity without ceremony.
+    New,
+    /// A ledger exists but records no identity — written before
+    /// 0.1.1. Its embedder is *unknown*, not "probably the same":
+    /// opening it under any configuration requires the explicit
+    /// recalibrate acknowledgement. Never guess.
+    Legacy,
+    /// The identity the ledger recorded, verbatim.
+    Known(String),
+}
+
 pub struct Ledger {
     dir: String,
     stream_id: String,
@@ -149,9 +169,44 @@ pub struct Ledger {
     /// The grid every verdict in this ledger is numbered against.
     /// Written into lens.txt; a reader must never have to guess it.
     pub grid: harbor_watch::record::Grid,
+    /// The embedder identity every tell in this ledger is
+    /// produced by (deficit D1): `name@version`, or `unknown`
+    /// when the operator declared none. Written into lens.txt,
+    /// state.txt and health.txt; the comparability of rows
+    /// across time is only defined within one identity.
+    pub embedder_identity: String,
 }
 
 impl Ledger {
+    /// Read the identity an existing ledger recorded, without
+    /// touching anything. The lens carries the identity line;
+    /// a non-empty events.jsonl with no lens (or a lens with no
+    /// identity line) is a legacy ledger — it exists, and what
+    /// wrote it is unknown.
+    pub fn probe_identity(dir: &str) -> RecordedIdentity {
+        let lens = std::fs::read_to_string(format!("{dir}/lens.txt")).ok();
+        match lens {
+            Some(text) => {
+                for line in text.lines() {
+                    if let Some(v) = line.strip_prefix("embedder_identity = ") {
+                        return RecordedIdentity::Known(v.trim().to_string());
+                    }
+                }
+                RecordedIdentity::Legacy
+            }
+            None => {
+                let has_events = std::fs::metadata(format!("{dir}/events.jsonl"))
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false);
+                if has_events {
+                    RecordedIdentity::Legacy
+                } else {
+                    RecordedIdentity::New
+                }
+            }
+        }
+    }
+
     pub fn open(
         dir: &str,
         stream_id: &str,
@@ -159,6 +214,7 @@ impl Ledger {
         alpha: f64,
         soak: bool,
         grid: harbor_watch::record::Grid,
+        embedder_identity: &str,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let events = OpenOptions::new()
@@ -182,6 +238,7 @@ impl Ledger {
             alpha,
             gate_diff: None,
             grid,
+            embedder_identity: embedder_identity.to_string(),
         };
         l.write_all()?;
         Ok(l)
@@ -337,6 +394,7 @@ impl Ledger {
         let mut t = String::new();
         t.push_str(&format!("stream_id = {}\n", self.stream_id));
         t.push_str(&format!("grid = {}\n", self.grid));
+        t.push_str(&format!("embedder_identity = {}\n", self.embedder_identity));
         t.push_str(&format!(
             "period_ms = {}\n",
             s.period_ms_ema
@@ -392,6 +450,7 @@ impl Ledger {
             "embedder = {}\n",
             if self.embedder_up { "up" } else { "down" }
         ));
+        t.push_str(&format!("embedder_identity = {}\n", self.embedder_identity));
         t.push_str(&format!(
             "embedder_started_by_me = {}\n",
             self.embedder_started_by_me
@@ -418,13 +477,14 @@ impl Ledger {
             epoch_us().saturating_sub(s.last_frame_wall_us) as f64 / 1000.0
         };
         format!(
-            "embed_ms_p50 = {:.2}\nembed_ms_p99 = {:.2}\nembed_ms_n = {}\nframes_pending_max = {}\nlast_frame_age_ms = {:.1}\nembedder = {}\nfreshness = {}\nframes_novel = {}\nframes_repeated = {}\nconsecutive_repeats = {}\nsilence_meaningful = {}\nupdated_wall_us = {}\n",
+            "embed_ms_p50 = {:.2}\nembed_ms_p99 = {:.2}\nembed_ms_n = {}\nframes_pending_max = {}\nlast_frame_age_ms = {:.1}\nembedder = {}\nembedder_identity = {}\nfreshness = {}\nframes_novel = {}\nframes_repeated = {}\nconsecutive_repeats = {}\nsilence_meaningful = {}\nupdated_wall_us = {}\n",
             p50,
             p99,
             s.embed_ms_window.len(),
             s.frames_pending_max,
             age_ms,
             if self.embedder_up { "up" } else { "down" },
+            self.embedder_identity,
             s.freshness(),
             s.frames_novel,
             s.frames_repeated,
@@ -499,7 +559,8 @@ mod tests {
     #[test]
     fn freshness_transitions_and_the_frozen_threshold() {
         let dir = tempdir("fresh");
-        let mut l = Ledger::open(&dir, "s", 0.25, 0.1, false, Grid::default()).unwrap();
+        let mut l =
+            Ledger::open(&dir, "s", 0.25, 0.1, false, Grid::default(), "test-emb@1").unwrap();
         assert_eq!(l.stats.freshness(), "unknown");
         assert_eq!(l.observe_freshness(false), FreshnessTransition::None);
         assert_eq!(l.stats.freshness(), "live");
@@ -516,7 +577,8 @@ mod tests {
     #[test]
     fn frozen_health_withdraws_meaning_from_silence() {
         let dir = tempdir("health");
-        let mut l = Ledger::open(&dir, "s", 0.25, 0.1, false, Grid::default()).unwrap();
+        let mut l =
+            Ledger::open(&dir, "s", 0.25, 0.1, false, Grid::default(), "test-emb@1").unwrap();
         l.embedder_up = true;
         l.stats.frames_seen = 3;
         l.observe_freshness(false);
@@ -535,7 +597,16 @@ mod tests {
     #[test]
     fn verdict_row_is_the_documented_golden_shape() {
         let dir = tempdir("golden");
-        let mut l = Ledger::open(&dir, "golden-stream", 0.25, 0.1, false, Grid::default()).unwrap();
+        let mut l = Ledger::open(
+            &dir,
+            "golden-stream",
+            0.25,
+            0.1,
+            false,
+            Grid::default(),
+            "test-emb@1",
+        )
+        .unwrap();
         let out = changed_output();
         l.record_frame(&out, epoch_us(), 2, 2, &[100.0, 100.0], 0)
             .unwrap();
@@ -566,10 +637,71 @@ mod tests {
         assert_eq!(events2.matches("\"kind\":\"verdict\"").count(), 1);
     }
 
+    /// D1 — identity is recorded in all three human surfaces, and
+    /// the probe reads back exactly what a previous run stamped.
+    #[test]
+    fn identity_is_recorded_and_probeable() {
+        let dir = tempdir("identity");
+        assert_eq!(Ledger::probe_identity(&dir), RecordedIdentity::New);
+        let l = Ledger::open(
+            &dir,
+            "s",
+            0.25,
+            0.1,
+            false,
+            Grid::default(),
+            "jev-rack@ijepa-1.0",
+        )
+        .unwrap();
+        assert!(l
+            .lens_text()
+            .contains("embedder_identity = jev-rack@ijepa-1.0"));
+        assert!(l
+            .state_text()
+            .contains("embedder_identity = jev-rack@ijepa-1.0"));
+        assert!(l
+            .health_text()
+            .contains("embedder_identity = jev-rack@ijepa-1.0"));
+        assert_eq!(
+            Ledger::probe_identity(&dir),
+            RecordedIdentity::Known("jev-rack@ijepa-1.0".to_string())
+        );
+    }
+
+    /// D1 — a pre-0.1.1 ledger (lens with no identity line, or
+    /// events with no lens at all) probes as Legacy, never as the
+    /// identity a caller would like it to be.
+    #[test]
+    fn pre_identity_ledgers_probe_as_legacy() {
+        let dir = tempdir("legacy");
+        std::fs::write(
+            format!("{dir}/lens.txt"),
+            "stream_id = s\ngrid = 4x4\nthreshold = 0.2500\n",
+        )
+        .unwrap();
+        assert_eq!(Ledger::probe_identity(&dir), RecordedIdentity::Legacy);
+        let dir2 = tempdir("legacy-events-only");
+        std::fs::write(format!("{dir2}/events.jsonl"), "{\"kind\":\"service\"}\n").unwrap();
+        assert_eq!(Ledger::probe_identity(&dir2), RecordedIdentity::Legacy);
+        // An empty events file alone is not a ledger anyone wrote.
+        let dir3 = tempdir("empty-events");
+        std::fs::write(format!("{dir3}/events.jsonl"), "").unwrap();
+        assert_eq!(Ledger::probe_identity(&dir3), RecordedIdentity::New);
+    }
+
     #[test]
     fn embed_everything_baseline_scales_with_the_grid() {
         let dir = tempdir("grid");
-        let mut l = Ledger::open(&dir, "s", 0.25, 0.1, true, Grid::new(2, 2).unwrap()).unwrap();
+        let mut l = Ledger::open(
+            &dir,
+            "s",
+            0.25,
+            0.1,
+            true,
+            Grid::new(2, 2).unwrap(),
+            "test-emb@1",
+        )
+        .unwrap();
         let mut out = changed_output();
         out.tiles = (0..4).map(|t| tile_verdict(t, t == 1)).collect();
         out.verdict.changed_tiles = vec![1];

@@ -36,6 +36,12 @@ fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // --recalibrate: the operator's explicit acknowledgement of
+    // an embedder swap against an existing ledger (deficit D1).
+    // A bare flag, valid for both verbs; stripped before verb
+    // and positional parsing.
+    let recalibrate_flag = args.iter().any(|a| a == "--recalibrate");
+    args.retain(|a| a != "--recalibrate");
     let mut verb = "watch";
     if let Some(first) = args.first() {
         match first.as_str() {
@@ -51,7 +57,7 @@ fn main() {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: telltape watch --config <file>\n       telltape index <footage> --config <file> [--fps N]"
+                    "usage: telltape watch --config <file> [--recalibrate]\n       telltape index <footage> --config <file> [--fps N] [--recalibrate]\n       (--recalibrate acknowledges an embedder swap against an existing ledger)"
                 );
                 std::process::exit(0);
             }
@@ -65,6 +71,9 @@ fn main() {
         eprintln!("config: {e}");
         std::process::exit(2);
     });
+    if recalibrate_flag {
+        cfg.recalibrate = true;
+    }
     if verb == "index" {
         if let Some(fps) = arg_value(&args, "--fps") {
             match fps.parse::<f64>() {

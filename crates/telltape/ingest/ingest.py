@@ -189,6 +189,13 @@ class HashEmbedder(Embedder):
     """Test double: a deterministic pseudo-embedding derived from
     the tile's PNG bytes (SHA-256 expansion, unit-normalised).
 
+    Identity: the service records this adapter in ledgers as
+    `double@1` (see declare_adapter_identity in the Rust index
+    module) — the `1` is THIS expansion algorithm's version.
+    Changing the expansion changes the embedding space: bump
+    the version here and there together, so ledgers written by
+    the old expansion refuse the new one as a swap.
+
     NOT a perception model. Two different tiles get near-orthogonal
     vectors (cosine distance ~1); the same bytes get the same
     vector. It exists so the pipeline, the diff gate's economics

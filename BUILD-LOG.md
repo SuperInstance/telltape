@@ -377,3 +377,71 @@ doctrine:
   excluding build artifacts), and the test suite + staged
   acceptance were re-run green under the new name before this
   entry was written (numbers in the verification commit).
+
+## D1 fix — embedder identity in the ledger (2026-11-02, v0.1.1)
+
+**Defect** (paper-leverage review of arXiv:2610.39302,
+`docs/PAPER-LEVERAGE-2610.39302.md` in the origin repo, deficit
+D1): the ledger guarded an embedder swap only by embedding
+*width*. A same-width swap — 1280-dim model A → 1280-dim model
+B — passed every guard while silently invalidating the per-tile
+baselines, the gate calibration, and the comparability of rows
+across the swap: per the Platonic-representation robustness
+results the two spaces are related by at best a rotation, and
+the rotation is not recoverable from unpaired data. The ledger
+could not even say *which* embedder had produced a tell.
+
+**Fix** (surgical; no new features):
+
+- **Identity is recorded.** `embedder_identity` (`name@version`,
+  bare name, or `unknown` when undeclared) is written into
+  lens.txt, state.txt and health.txt on every run. Source: the
+  config keys `embedder_name` / `embedder_version`. For `index`,
+  where the tool composes the ingest command itself, the identity
+  is derived from the adapter the config selects — `double@1`
+  for the built-in test double (it reports itself honestly as
+  the double; the `1` is its hash-expansion algorithm version,
+  cross-noted in ingest.py), `http@<endpoint URL>` for the
+  generic HTTP adapter (the URL is the only version a generic
+  endpoint has). An operator-declared identity always wins.
+- **A swap refuses.** Before opening — opening rewrites the
+  lens, so the recorded identity is probed first
+  (`Ledger::probe_identity`) — a configured identity that
+  differs from the recorded one is a typed refusal,
+  `ServiceError::EmbedderMismatch`, naming both identities.
+  The refused run writes nothing (test-asserted: the lens still
+  belongs to the old embedder afterwards). Silent continuation
+  on old baselines is impossible.
+- **Recalibration is explicit.** `recalibrate = true` in the
+  config (or `--recalibrate` on either verb) acknowledges the
+  swap: the run proceeds on fresh baselines and receipts an
+  `embedder_swap` service row naming old → new — a swap is a
+  lens change, and the receipt fences pre-swap verdicts from
+  post-swap ones in the same append-only stream.
+- **Legacy ledgers are never guessed.** A pre-0.1.1 ledger has
+  no identity line; it probes as `Legacy` and its embedder
+  reads as `unknown (pre-0.1.1 ledger: no embedder identity
+  recorded)`. Opening one under *any* configuration — including
+  an undeclared one — requires the same one-time recalibrate
+  acknowledgement, after which it is stamped and resumes
+  normally. Migration note added to docs/LEDGER-FORMAT.md,
+  along with the identity fields and the swap rule.
+
+**Tests**: 93 → 99, all green; clippy `--all-targets -D warnings`
+clean; `cargo fmt --check` clean. New: config identity
+composition; ledger identity recording + probe (new / known /
+legacy, incl. events-only and empty-events edges); index
+identity derivation (double / http-URL / operator-declared
+wins); integration — same-width swap refused with both
+identities named and no writes, acknowledged swap receipts and
+re-stamps, same-identity resume unaffected, legacy ledger
+refused then stamped by the acknowledgement. Staged acceptance
+unchanged, re-run cold: 18 frames, 34 embeds, 2 events, frame 4
+= 16/16 tiles, frame 7 = exactly {5,6} — and the CLI refusal
+path exercised end-to-end against that ledger (exit 1 naming
+'unknown' → 'model-b@2'; `--recalibrate` proceeds and receipts;
+resume proceeds).
+
+**Version**: all three workspace crates 0.1.0 → 0.1.1; tagged
+v0.1.1 locally. Not pushed — publication stays the gated step,
+as before.

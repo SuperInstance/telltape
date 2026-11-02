@@ -80,10 +80,42 @@ pub fn index_ingest_cmd(cfg: &Config, source: &str) -> Result<String, ServiceErr
     Ok(cmd)
 }
 
+/// The identity `index` records for the ingest's built-in test
+/// double (deficit D1). The version component is the double's
+/// pseudo-embedding algorithm version — `HashEmbedder` in
+/// ingest.py. The double reports itself honestly as the double;
+/// if the hash expansion ever changes, bump this version and
+/// the ingest together: a changed expansion is a changed
+/// embedding space, and old ledgers must refuse it as a swap.
+const DOUBLE_NAME: &str = "double";
+const DOUBLE_VERSION: &str = "1";
+
+/// Fill the run's embedder identity from the adapter the config
+/// itself selects for the composed command — when the operator
+/// has not declared one. A declared identity always wins: the
+/// operator may know the endpoint as a name (`jev-rack@…`) that
+/// no URL can express. For the generic HTTP adapter, the
+/// endpoint URL is the version component — it is the only
+/// version a generic endpoint has, so re-pointing the config at
+/// a different endpoint reads as the swap it is.
+fn declare_adapter_identity(run_cfg: &mut Config) {
+    if !run_cfg.embedder_name.is_empty() {
+        return;
+    }
+    if run_cfg.embed_url.is_empty() {
+        run_cfg.embedder_name = DOUBLE_NAME.to_string();
+        run_cfg.embedder_version = DOUBLE_VERSION.to_string();
+    } else {
+        run_cfg.embedder_name = "http".to_string();
+        run_cfg.embedder_version = run_cfg.embed_url.clone();
+    }
+}
+
 /// Index one footage source into the configured ledger.
 pub fn index_file(cfg: &Config, source: &str) -> Result<Summary, ServiceError> {
     let mut run_cfg = cfg.clone();
     run_cfg.ingest_cmd = index_ingest_cmd(cfg, source)?;
+    declare_adapter_identity(&mut run_cfg);
     service::run(&run_cfg)
 }
 
@@ -112,6 +144,26 @@ mod tests {
         assert!(cmd.contains("--embedder http"), "{cmd}");
         assert!(cmd.contains("--embed-url 'http://h:9/embed'"), "{cmd}");
         assert!(cmd.contains("--embed-dim 768"), "{cmd}");
+    }
+
+    #[test]
+    fn index_identity_comes_from_the_selected_adapter() {
+        // No embed URL: the composed command runs the test
+        // double, and the ledger must say so, honestly.
+        let mut cfg = parse_config("").unwrap();
+        declare_adapter_identity(&mut cfg);
+        assert_eq!(cfg.embedder_identity(), "double@1");
+        // An endpoint: the URL is the version a generic
+        // endpoint has.
+        let mut cfg = parse_config("embed_url = http://h:9/embed\n").unwrap();
+        declare_adapter_identity(&mut cfg);
+        assert_eq!(cfg.embedder_identity(), "http@http://h:9/embed");
+        // A declared identity is the operator's word; keep it.
+        let mut cfg =
+            parse_config("embed_url = http://h:9/embed\nembedder_name = jev-rack\nembedder_version = ijepa-1.0\n")
+                .unwrap();
+        declare_adapter_identity(&mut cfg);
+        assert_eq!(cfg.embedder_identity(), "jev-rack@ijepa-1.0");
     }
 
     #[test]

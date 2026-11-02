@@ -24,9 +24,17 @@
 //! `stop_embedder_on_exit` is set. With no health URL configured
 //! (the ingest's in-process test double, or an embedder managed
 //! elsewhere) no external check is possible and none is made.
+//!
+//! Embedder identity (deficit D1): before opening the ledger the
+//! run probes the identity the ledger recorded. A different
+//! configured identity — same width or not — is a typed refusal
+//! unless the operator recalibrates (`recalibrate` /
+//! `--recalibrate`), in which case the swap is receipted in the
+//! ledger's own event stream and the run starts from fresh
+//! baselines, exactly as a lens change would.
 
 use crate::config::{Config, ConfigError};
-use crate::ledger::{epoch_us, Ledger};
+use crate::ledger::{epoch_us, Ledger, RecordedIdentity};
 use crate::live::LivePipeline;
 use harbor_watch::pipeline::{Config as PipeConfig, PipelineError};
 use harbor_watch::record::{parse_record, InputRecord};
@@ -44,6 +52,21 @@ pub enum ServiceError {
     Ledger(std::io::Error),
     /// Bad configuration (including an invalid grid).
     Config(ConfigError),
+    /// The ledger on disk was written under a different
+    /// embedder identity than this run's config declares
+    /// (deficit D1): a swap — or a pre-0.1.1 ledger that records
+    /// no identity at all. The width guard cannot see this: two
+    /// embedders of the same width still live in different
+    /// spaces, related by at best a rotation, so the old
+    /// baselines and gate calibration do not transfer. Refused
+    /// unless the operator explicitly recalibrates.
+    EmbedderMismatch {
+        /// The identity the ledger recorded (or the legacy
+        /// explanation, verbatim).
+        recorded: String,
+        /// The identity this run's config declares.
+        configured: String,
+    },
     /// The configured embedder never became healthy.
     EmbedderUnhealthy {
         url: String,
@@ -61,6 +84,17 @@ impl fmt::Display for ServiceError {
         match self {
             ServiceError::Ledger(e) => write!(f, "ledger: {e}"),
             ServiceError::Config(e) => write!(f, "config: {e}"),
+            ServiceError::EmbedderMismatch {
+                recorded,
+                configured,
+            } => write!(
+                f,
+                "embedder identity mismatch: this ledger was written by embedder \
+                 '{recorded}' but the configured embedder is '{configured}'. A swap \
+                 is a lens change — the old baselines and gate calibration do not \
+                 transfer. Refusing to continue; to accept the swap and recalibrate, \
+                 set recalibrate = true in the config (or pass --recalibrate)"
+            ),
             ServiceError::EmbedderUnhealthy {
                 url,
                 autostart,
@@ -184,8 +218,45 @@ fn run_shell_cmd(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// How a pre-0.1.1 ledger's missing identity is named in
+/// refusals and swap receipts: unknown, with the reason attached
+/// — never a guessed name.
+const LEGACY_IDENTITY: &str = "unknown (pre-0.1.1 ledger: no embedder identity recorded)";
+
 pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
     let grid = cfg.grid()?;
+    // ---- embedder identity guard (deficit D1), BEFORE opening:
+    // opening rewrites the lens, so the recorded identity is
+    // probed first. A mismatch — including a legacy ledger whose
+    // embedder is simply unknown — is a refusal unless the
+    // operator explicitly recalibrates; a swap is a lens change
+    // and silently continuing on the old baselines must be
+    // impossible.
+    let configured_identity = cfg.embedder_identity();
+    let recalibrated_from: Option<String> = match Ledger::probe_identity(&cfg.ledger_dir) {
+        RecordedIdentity::New => None,
+        RecordedIdentity::Known(id) if id == configured_identity => None,
+        RecordedIdentity::Known(id) => {
+            if cfg.recalibrate {
+                Some(id)
+            } else {
+                return Err(ServiceError::EmbedderMismatch {
+                    recorded: id,
+                    configured: configured_identity,
+                });
+            }
+        }
+        RecordedIdentity::Legacy => {
+            if cfg.recalibrate {
+                Some(LEGACY_IDENTITY.to_string())
+            } else {
+                return Err(ServiceError::EmbedderMismatch {
+                    recorded: LEGACY_IDENTITY.to_string(),
+                    configured: configured_identity,
+                });
+            }
+        }
+    };
     let mut ledger = Ledger::open(
         &cfg.ledger_dir,
         &cfg.stream_id,
@@ -193,10 +264,24 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
         cfg.alpha,
         cfg.soak,
         grid,
+        &configured_identity,
     )?;
     ledger
         .service_event("start", &format!("stream {} starting", cfg.stream_id))
         .ok();
+    if let Some(old) = &recalibrated_from {
+        eprintln!(
+            "[telltape] embedder swap accepted by operator: {old} -> {configured_identity}; recalibrating"
+        );
+        ledger
+            .service_event(
+                "embedder_swap",
+                &format!(
+                    "embedder changed: {old} -> {configured_identity}; baselines and gate calibration reset (lens change); recalibration explicitly acknowledged by the operator"
+                ),
+            )
+            .ok();
+    }
 
     // ---- embedder lifecycle: ensure up before ingest starts embedding
     let mut embedder_started_by_me = false;

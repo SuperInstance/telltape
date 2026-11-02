@@ -86,6 +86,7 @@ fn ledger_files_and_lineage() {
         0.1,
         false,
         harbor_watch::record::Grid::default(),
+        "test-emb@1",
     )
     .unwrap();
     let fx = fixture::generate(64, 7);
@@ -110,6 +111,7 @@ fn ledger_files_and_lineage() {
     assert!(health.contains("embed_ms_p99"), "{health}");
     let lens = std::fs::read_to_string(format!("{dir}/lens.txt")).unwrap();
     assert!(lens.contains("tile_score_ema"), "{lens}");
+    assert!(lens.contains("embedder_identity = test-emb@1"), "{lens}");
     let events = std::fs::read_to_string(format!("{dir}/events.jsonl")).unwrap();
     let verdicts: Vec<&str> = events
         .lines()
@@ -213,6 +215,123 @@ fn index_replays_an_image_sequence_through_the_same_pipeline() {
     assert!(events.contains("\"frame\":5"), "{events}");
     assert!(events.contains("\"changed_tiles\":[0, 1, 2"), "{events}");
     assert!(events.contains("source_frozen"), "{events}");
+    // D1: index selected the test double, and the ledger says so.
+    let lens = std::fs::read_to_string(format!("{dir}/ledger/lens.txt")).unwrap();
+    assert!(lens.contains("embedder_identity = double@1"), "{lens}");
+}
+
+/// D1 — the same-width swap. Both runs below would produce
+/// records of identical width (nothing about the width changes;
+/// only the declared embedder identity does) — exactly the case
+/// the old width-only guard passed silently. The swap must be
+/// refused with both identities named, a refusal must write
+/// nothing, an acknowledged swap must proceed and receipt
+/// itself in the ledger, and a same-identity resume must be
+/// unaffected.
+#[test]
+fn same_width_embedder_swap_is_refused_until_recalibrated() {
+    let dir = tempdir("swap");
+    let base = Config {
+        stream_id: "s".into(),
+        ledger_dir: format!("{dir}/ledger"),
+        ingest_cmd: "true".into(),
+        embed_url: String::new(),
+        ..Config::default()
+    };
+    let run_a = Config {
+        embedder_name: "model-a".into(),
+        embedder_version: "1".into(),
+        ..base.clone()
+    };
+    service::run(&run_a).expect("first run stamps the ledger");
+    let lens = std::fs::read_to_string(format!("{dir}/ledger/lens.txt")).unwrap();
+    assert!(lens.contains("embedder_identity = model-a@1"), "{lens}");
+
+    let run_b = Config {
+        embedder_name: "model-b".into(),
+        embedder_version: "1".into(),
+        ..base.clone()
+    };
+    match service::run(&run_b) {
+        Err(service::ServiceError::EmbedderMismatch {
+            recorded,
+            configured,
+        }) => {
+            assert_eq!(recorded, "model-a@1");
+            assert_eq!(configured, "model-b@1");
+        }
+        other => panic!("a same-width swap must be refused, got {other:?}"),
+    }
+    // The refusal is not a write: the ledger still belongs to A.
+    let lens = std::fs::read_to_string(format!("{dir}/ledger/lens.txt")).unwrap();
+    assert!(lens.contains("embedder_identity = model-a@1"), "{lens}");
+    let events = std::fs::read_to_string(format!("{dir}/ledger/events.jsonl")).unwrap();
+    assert!(!events.contains("embedder_swap"), "{events}");
+
+    // Acknowledged: the swap proceeds and receipts itself.
+    let run_b_ack = Config {
+        recalibrate: true,
+        ..run_b.clone()
+    };
+    service::run(&run_b_ack).expect("an acknowledged swap recalibrates");
+    let events = std::fs::read_to_string(format!("{dir}/ledger/events.jsonl")).unwrap();
+    assert!(events.contains("\"event\":\"embedder_swap\""), "{events}");
+    assert!(events.contains("model-a@1"), "{events}");
+    assert!(events.contains("model-b@1"), "{events}");
+    let lens = std::fs::read_to_string(format!("{dir}/ledger/lens.txt")).unwrap();
+    assert!(lens.contains("embedder_identity = model-b@1"), "{lens}");
+
+    // Same identity again: an ordinary resume, no flag needed.
+    service::run(&run_b).expect("same-identity resume is unaffected");
+}
+
+/// D1 — the migration path. A pre-0.1.1 ledger records no
+/// identity; its embedder is unknown and must never be guessed
+/// to be "the same one". Even an undeclared (unknown) config is
+/// refused until the operator acknowledges the recalibration
+/// once — after which the ledger is stamped and resumes
+/// normally.
+#[test]
+fn legacy_ledger_requires_the_recalibrate_acknowledgement() {
+    let dir = tempdir("legacy");
+    let ledger_dir = format!("{dir}/ledger");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    // The pre-0.1.1 lens shape: no embedder_identity line.
+    std::fs::write(
+        format!("{ledger_dir}/lens.txt"),
+        "stream_id = s\ngrid = 4x4\nperiod_ms = unknown\nthreshold = 0.2500\nalpha = 0.1000\nframes_observed = 12\n",
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{ledger_dir}/events.jsonl"),
+        "{\"kind\":\"service\",\"event\":\"start\",\"msg\":\"stream s starting\",\"wall_us\":1}\n",
+    )
+    .unwrap();
+    let cfg = Config {
+        stream_id: "s".into(),
+        ledger_dir: ledger_dir.clone(),
+        ingest_cmd: "true".into(),
+        embed_url: String::new(),
+        ..Config::default()
+    };
+    match service::run(&cfg) {
+        Err(service::ServiceError::EmbedderMismatch { recorded, .. }) => {
+            assert!(recorded.contains("pre-0.1.1"), "{recorded}");
+        }
+        other => panic!("a legacy ledger must be refused unacknowledged, got {other:?}"),
+    }
+    let ack = Config {
+        recalibrate: true,
+        ..cfg.clone()
+    };
+    service::run(&ack).expect("the acknowledgement stamps the legacy ledger");
+    let events = std::fs::read_to_string(format!("{ledger_dir}/events.jsonl")).unwrap();
+    assert!(events.contains("\"event\":\"embedder_swap\""), "{events}");
+    assert!(events.contains("pre-0.1.1"), "{events}");
+    let lens = std::fs::read_to_string(format!("{ledger_dir}/lens.txt")).unwrap();
+    assert!(lens.contains("embedder_identity = unknown"), "{lens}");
+    // Stamped now: an ordinary unknown-identity resume works.
+    service::run(&cfg).expect("a stamped ledger resumes without the flag");
 }
 
 /// Found by the slice-5 stranger walk: an ingest that dies at
