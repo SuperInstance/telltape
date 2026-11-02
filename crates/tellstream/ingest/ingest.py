@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""tellstream ingest: frames -> tiles -> diff gate -> embeddings.
+
+Owns everything the Rust service should not: frame acquisition, image
+decode, tiling, the cheap frame-diff gate, and the embedder calls.
+Emits, on stdout, the record schema (one JSON object per embedded
+tile) plus a frame_end control line per frame:
+
+  {"seq":0,"frame":F,"tile":T,"t_arrival_us":<capture epoch us>,
+   "diff_score":D,"embed_ms":M,"embedding":[<embed_dim> floats]}
+  {"control":"frame_end","frame":F,"t_capture_us":<capture epoch us>,
+   "nominated":K,"gate_diff":G,"frame_hash":H,"frame_repeat":false}
+
+Sources (identical interface — the service cannot tell them apart):
+  staged   staged-events sequence (cut / object / drift) composited
+           from the bundled fixture photos, ground truth written to
+           --truth-out. The acceptance rig.
+  wave3    the wave-3 frame sequences (A burst, B turntable,
+           C interleaved cuts). Frames resolve from the bundled
+           fixtures by default; see fixtures_dir() for the override
+           order (explicit --fixtures-dir / env, then bundled).
+  shot     IP Webcam style: poll GET <url> for one JPEG per frame.
+  mjpeg    IP Webcam style: MJPEG stream at <url> (/video), frames
+           taken at the lens cadence, drop-to-newest.
+
+Embedders (one seam, three adapters — see
+docs/BRING-YOUR-OWN-EMBEDDER.md):
+  double   HashEmbedder: a deterministic byte-hash pseudo-embedding.
+           NOT a perception model — it exists so the whole tool runs
+           end-to-end with zero infrastructure for evaluation and
+           tests. Its distances saturate (~1 for any two different
+           tiles), so verdicts through it exercise the pipeline, the
+           gate economics and the ledger — never perception quality.
+  http     HttpEmbedder: any HTTP service answering the documented
+           shape (multipart POST of a tile PNG, JSON vector back).
+           URL, multipart field name and response key are config.
+  jev      JevRackEmbedder: the origin fleet's JEV rack (I-JEPA),
+           which happens to speak exactly the http shape. One
+           adapter among others, not the definition of the seam.
+
+Gate: frame 0 embeds every tile (baseline). Later frames embed a
+tile iff its mean-abs diff vs the previous frame exceeds --gate.
+This is the wave-3 CHANGED strategy, live.
+
+Freshness: every frame is hashed (cheap, over a downsampled view);
+frame_end carries the hash and whether this frame is byte-identical
+to the previous one, so the service can tell a frozen source from a
+quiet scene (the soak incident — see docs/EXAMPLES.md E3).
+"""
+import argparse, glob, hashlib, io, json, os, sys, time
+import numpy as np
+import requests
+from PIL import Image
+
+TILES = 16
+
+
+def fixtures_dir():
+    """Where the bundled cold fixtures live, in resolution order:
+
+    1. `--fixtures-dir DIR` (explicit config, set in main()),
+    2. `$TELLSTREAM_FIXTURES_DIR`,
+    3. the fixtures bundled in this repo at `crates/tellstream/fixtures/`
+       (resolved relative to this file, never the CWD or $HOME).
+
+    A stranger running from a fresh clone always lands on (3): no
+    path in anyone's home directory is a default anywhere in this
+    file. A full local frame library (e.g. a larger wave-3 set) is
+    reachable only through the explicit TELLSTREAM_WAVE3_A_GLOB /
+    TELLSTREAM_WAVE3_B_GLOB / TELLSTREAM_WAVE3_B_FILE overrides in
+    wave3_frames().
+    """
+    if getattr(fixtures_dir, "override", None):
+        return fixtures_dir.override
+    env = os.environ.get("TELLSTREAM_FIXTURES_DIR")
+    if env:
+        return env
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        os.pardir, "fixtures")
+
+
+def now_us():
+    return int(time.time() * 1_000_000)
+
+
+def tiles_of(frame):
+    h, w = frame.shape[:2]
+    th, tw = h // 4, w // 4
+    return [frame[r * th:(r + 1) * th, c * tw:(c + 1) * tw]
+            for r in range(4) for c in range(4)]
+
+
+def frame_hash(frame):
+    """Cheap novelty hash: SHA-256 over a 32x32 downsampled view of
+    the frame. Byte-identical source frames hash identically; any
+    real camera noise changes the hash. Used only for freshness
+    (is this the same image again?), never for perception."""
+    small = frame[::max(1, frame.shape[0] // 32),
+                  ::max(1, frame.shape[1] // 32)]
+    return hashlib.sha256(np.ascontiguousarray(
+        np.clip(small, 0, 255).astype(np.uint8)).tobytes()).hexdigest()[:16]
+
+
+# ---------------- embedder seam ----------------
+
+class Embedder:
+    """The seam: embed(tile_img) -> (vector, embed_ms).
+
+    `dim` is the vector width this adapter produces; the Emitter
+    checks it against the configured embed_dim once at startup
+    (probe), so a width mismatch fails once, loudly, at start —
+    not per tile, mid-stream."""
+
+    name = "abstract"
+    dim = 0
+
+    def embed(self, tile_img):
+        raise NotImplementedError
+
+    def probe(self):
+        """Embed one tiny synthetic tile and verify the width."""
+        tile = np.zeros((8, 8, 3), dtype=np.float32)
+        vec, _ = self.embed(tile)
+        if len(vec) != self.dim:
+            raise RuntimeError(
+                f"embedder {self.name}: probe returned dim {len(vec)}, "
+                f"expected {self.dim} — fix --embed-dim or the service")
+        return True
+
+
+class HttpEmbedder(Embedder):
+    """Generic HTTP embedding service: POST the tile as a PNG in a
+    multipart form field, read a JSON vector from a response key."""
+
+    name = "http"
+
+    def __init__(self, url, field="file", key="embedding", dim=1280):
+        self.url = url
+        self.field = field
+        self.key = key
+        self.dim = dim
+        self.session = requests.Session()
+
+    def embed(self, tile_img):
+        buf = io.BytesIO()
+        Image.fromarray(tile_img.astype(np.uint8)).save(buf, format="PNG")
+        data = buf.getvalue()
+        t0 = time.perf_counter()
+        r = self.session.post(
+            self.url,
+            files={self.field: ("tile.png", data, "image/png")},
+            timeout=600)
+        dt = (time.perf_counter() - t0) * 1000.0
+        r.raise_for_status()
+        emb = r.json()[self.key]
+        return [float(x) for x in emb], dt
+
+
+class JevRackEmbedder(HttpEmbedder):
+    """The origin fleet's JEV rack (I-JEPA over HTTP) — the adapter
+    the tool was first built against. It speaks the generic shape,
+    so this class is only the rack's URL layout with a name."""
+
+    name = "jev-rack"
+
+    def __init__(self, rack_url, dim=1280):
+        super().__init__(rack_url.rstrip("/") + "/embed/image",
+                         field="file", key="embedding", dim=dim)
+
+
+class HashEmbedder(Embedder):
+    """Test double: a deterministic pseudo-embedding derived from
+    the tile's PNG bytes (SHA-256 expansion, unit-normalised).
+
+    NOT a perception model. Two different tiles get near-orthogonal
+    vectors (cosine distance ~1); the same bytes get the same
+    vector. It exists so the pipeline, the diff gate's economics
+    and the ledger can be exercised end-to-end with zero
+    infrastructure — see the header of this file for exactly what
+    a run through it does and does not prove."""
+
+    name = "double"
+
+    def __init__(self, dim=1280):
+        self.dim = dim
+
+    def embed(self, tile_img):
+        t0 = time.perf_counter()
+        buf = io.BytesIO()
+        Image.fromarray(tile_img.astype(np.uint8)).save(buf, format="PNG")
+        seed = hashlib.sha256(buf.getvalue()).digest()
+        vals = []
+        counter = 0
+        while len(vals) < self.dim:
+            block = hashlib.sha256(
+                seed + counter.to_bytes(4, "little")).digest()
+            for i in range(0, 32, 4):
+                vals.append(
+                    int.from_bytes(block[i:i + 4], "little") / 2**32 - 0.5)
+            counter += 1
+        v = np.array(vals[:self.dim], dtype=np.float64)
+        n = float(np.linalg.norm(v))
+        if n > 0:
+            v = v / n
+        dt = (time.perf_counter() - t0) * 1000.0
+        return [float(x) for x in v], dt
+
+
+# ---------------- emitter ----------------
+
+class Emitter:
+    def __init__(self, embedder, gate):
+        self.embedder = embedder
+        self.gate = gate
+        self.prev_tiles = None
+        self.prev_hash = None
+
+    def embed(self, tile_img):
+        vec, ms = self.embedder.embed(tile_img)
+        if len(vec) != self.embedder.dim:
+            raise RuntimeError(
+                f"embedder {self.embedder.name}: dim {len(vec)} "
+                f"!= configured {self.embedder.dim}")
+        return vec, ms
+
+    def frame(self, img, frame_idx):
+        """Tile, gate, embed nominated tiles, emit records + frame_end."""
+        t_capture = now_us()
+        tls = tiles_of(img)
+        nominated = []
+        diffs = []
+        for ti, t in enumerate(tls):
+            if self.prev_tiles is None:
+                d = 255.0
+            else:
+                d = float(np.mean(np.abs(t - self.prev_tiles[ti])))
+            diffs.append(d)
+            if self.prev_tiles is None or d > self.gate:
+                nominated.append(ti)
+        for ti in nominated:
+            emb, ms = self.embed(tls[ti])
+            rec = {"seq": 0, "frame": frame_idx, "tile": ti,
+                   "t_arrival_us": t_capture,
+                   "diff_score": round(diffs[ti], 4),
+                   "embed_ms": round(ms, 2),
+                   "embedding": [round(float(x), 6) for x in emb]}
+            print(json.dumps(rec), flush=True)
+        h = frame_hash(img)
+        repeat = self.prev_hash is not None and h == self.prev_hash
+        self.prev_hash = h
+        print(json.dumps({"control": "frame_end", "frame": frame_idx,
+                          "t_capture_us": t_capture,
+                          "nominated": len(nominated),
+                          "gate_diff": self.gate,
+                          "frame_hash": h,
+                          "frame_repeat": repeat}), flush=True)
+        self.prev_tiles = tls
+        return len(nominated)
+
+
+# ---------------- staged sequence (bundled fixture photos) ----------------
+
+def _load_png(path):
+    return np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+
+
+def staged_frames():
+    """(frames, truth). 18 frames: 0-3 scene A, 4 CUT to scene B,
+    7 object added (a real-photo patch over tiles 5,6), 10-17 gradual
+    drift (slow brightening: per-frame diff must stay under the gate).
+
+    The scenes are composited from REAL photos — the bundled wave-3
+    fixture frames (fixtures/wave3/A-00.png, B-00.png) and the
+    fixture patch (fixtures/patch.png, a crop of A-03 at exactly the
+    placement rectangle below) — not synthetic colour fields: the
+    first version of this rig used flat gradient scenes and I-JEPA
+    embedded the two "different" scenes nearly identically (both are
+    flat fields with simple shapes to a model trained on natural
+    images) — the cut scored under threshold and published nothing.
+    A rig whose scenes the perception model cannot tell apart tests
+    nothing. There is deliberately NO synthetic fallback: if the
+    fixtures are missing the checkout is broken, and failing loudly
+    beats silently testing nothing."""
+    rng = np.random.default_rng(7)
+    fx = fixtures_dir()
+    s1 = _load_png(os.path.join(fx, "wave3", "A-00.png"))
+    s2 = _load_png(os.path.join(fx, "wave3", "B-00.png"))
+    patch = _load_png(os.path.join(fx, "patch.png"))  # 128x256, real photo
+
+    def noisy(base):
+        return np.clip(base + rng.normal(0, 1.0, base.shape), 0, 255)
+
+    def with_object(base):
+        out = base.copy()
+        out[128:256, 128:384] = patch                          # tiles 5,6
+        return out
+
+    frames = []
+    for _ in range(4):
+        frames.append(noisy(s1))
+    for _ in range(3):
+        frames.append(noisy(s2))
+    for _ in range(3):
+        frames.append(noisy(with_object(s2)))
+    for k in range(8):  # drift: +1.2 brightness/frame
+        frames.append(noisy(with_object(s2) + 1.2 * (k + 1)))
+    truth = {"cut_frame": 4, "object_frame": 7, "object_tiles": [5, 6],
+             "drift_frames": list(range(10, 18)), "frames": len(frames)}
+    return frames, truth
+
+
+# ---------------- wave-3 sequences (bundled fixtures by default) ----------------
+
+def _fixture_frames(name):
+    paths = sorted(glob.glob(os.path.join(
+        fixtures_dir(), "wave3", name + "-*.png")))
+    if not paths:
+        raise FileNotFoundError(
+            f"no bundled wave-3 fixtures matching {name}-*.png under "
+            f"{fixtures_dir()} — pass --fixtures-dir or set "
+            f"TELLSTREAM_FIXTURES_DIR (see fixtures/README.md)")
+    return [_load_png(p) for p in paths]
+
+
+def wave3_frames(seq):
+    """A = burst photos, B = turntable frames, C = interleaved cuts.
+
+    Default material is the bundled fixture set (6 A + 6 B — enough
+    for the full C sequence, which interleaves the first 6 of each).
+    A larger local library is used ONLY when explicitly configured:
+    TELLSTREAM_WAVE3_A_GLOB / TELLSTREAM_WAVE3_B_GLOB (globs of
+    image files) or TELLSTREAM_WAVE3_B_FILE (one multi-frame image,
+    e.g. the original animated webp — frames are centre-cropped to
+    square and resized to 512x512, as the original rig did)."""
+    a_glob = os.environ.get("TELLSTREAM_WAVE3_A_GLOB")
+    b_glob = os.environ.get("TELLSTREAM_WAVE3_B_GLOB")
+    b_file = os.environ.get("TELLSTREAM_WAVE3_B_FILE")
+    if a_glob:
+        A = [_load_png(p) for p in sorted(glob.glob(a_glob))]
+    else:
+        A = _fixture_frames("A")
+    if b_glob:
+        B = [_load_png(p) for p in sorted(glob.glob(b_glob))]
+    elif b_file:
+        img = Image.open(b_file)
+        B = []
+        for i in range(getattr(img, "n_frames", 1)):
+            img.seek(i)
+            fr = img.convert("RGB")
+            w, h = fr.size
+            fr = fr.crop((0, (h - w) // 2, w, (h - w) // 2 + w)).resize((512, 512))
+            B.append(np.asarray(fr, dtype=np.float32))
+    else:
+        B = _fixture_frames("B")
+    if seq == "A":
+        return A
+    if seq == "B":
+        return B
+    C = []
+    for i in range(6):
+        C.append(A[i]); C.append(B[i])
+    return C
+
+
+# ---------------- live HTTP sources ----------------
+
+def shot_frames(url):
+    s = requests.Session()
+    while True:
+        r = s.get(url, timeout=30)
+        r.raise_for_status()
+        img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        yield np.asarray(img, dtype=np.float32)
+
+
+def mjpeg_frames(url, cadence_ms):
+    s = requests.Session()
+    resp = s.get(url, stream=True, timeout=30)
+    resp.raise_for_status()
+    buf = bytearray()
+    last = 0.0
+    for chunk in resp.iter_content(chunk_size=65536):
+        buf.extend(chunk)
+        while True:
+            soi = buf.find(b"\xff\xd8")
+            if soi < 0:
+                break
+            eoi = buf.find(b"\xff\xd9", soi + 2)
+            if eoi < 0:
+                break
+            jpg = bytes(buf[soi:eoi + 2])
+            del buf[:eoi + 2]
+            now = time.time()
+            if (now - last) * 1000.0 >= cadence_ms:
+                last = now
+                try:
+                    img = Image.open(io.BytesIO(jpg)).convert("RGB")
+                except Exception:
+                    continue
+                yield np.asarray(img, dtype=np.float32)
+
+
+# ---------------- embedder construction ----------------
+
+def build_embedder(args):
+    if args.embedder == "double":
+        return HashEmbedder(dim=args.embed_dim)
+    if args.embedder == "http":
+        if not args.embed_url:
+            raise SystemExit("--embedder http needs --embed-url")
+        return HttpEmbedder(args.embed_url, field=args.embed_field,
+                            key=args.embed_key, dim=args.embed_dim)
+    if args.embedder == "jev":
+        return JevRackEmbedder(args.rack, dim=args.embed_dim)
+    raise SystemExit(f"unknown embedder {args.embedder}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--source", required=True,
+                    choices=["staged", "wave3", "shot", "mjpeg"])
+    ap.add_argument("--url", default="")
+    ap.add_argument("--seq", default="C", choices=["A", "B", "C"])
+    ap.add_argument("--gate", type=float, default=3.0)
+    ap.add_argument("--cadence-ms", type=float, default=100.0)
+    ap.add_argument("--embedder", default="double",
+                    choices=["double", "http", "jev"],
+                    help="double = built-in test double (zero "
+                         "infrastructure, NOT a perception model); "
+                         "http = generic HTTP embedding service; "
+                         "jev = the JEV rack adapter (I-JEPA)")
+    ap.add_argument("--embed-url", default="",
+                    help="for --embedder http: the embed endpoint URL")
+    ap.add_argument("--embed-field", default="file",
+                    help="multipart form field carrying the tile PNG")
+    ap.add_argument("--embed-key", default="embedding",
+                    help="JSON response key holding the vector")
+    ap.add_argument("--embed-dim", type=int, default=1280,
+                    help="expected embedding width; checked once at "
+                         "startup against the adapter")
+    ap.add_argument("--rack", default="http://127.0.0.1:8077",
+                    help="for --embedder jev: the rack base URL")
+    ap.add_argument("--max-frames", type=int, default=0)
+    ap.add_argument("--truth-out", default="")
+    ap.add_argument("--fixtures-dir", default="",
+                    help="fixture directory override (else "
+                         "$TELLSTREAM_FIXTURES_DIR, else the fixtures "
+                         "bundled in this repo)")
+    args = ap.parse_args()
+    if args.fixtures_dir:
+        fixtures_dir.override = args.fixtures_dir
+
+    embedder = build_embedder(args)
+    try:
+        embedder.probe()
+    except Exception as e:
+        print(f"ingest: embedder probe failed: {e}", file=sys.stderr)
+        return 2
+    print(f"ingest: embedder {embedder.name} ok (dim {embedder.dim})",
+          file=sys.stderr)
+
+    em = Emitter(embedder, args.gate)
+    if args.source == "staged":
+        frames, truth = staged_frames()
+        if args.truth_out:
+            with open(args.truth_out, "w") as fh:
+                json.dump(truth, fh)
+        gen = iter(frames)
+    elif args.source == "wave3":
+        gen = iter(wave3_frames(args.seq))
+    elif args.source == "shot":
+        gen = shot_frames(args.url)
+    else:
+        gen = mjpeg_frames(args.url, args.cadence_ms)
+
+    idx = 0
+    for img in gen:
+        t0 = time.time()
+        if img.shape[0] != 512 or img.shape[1] != 512:
+            img = np.asarray(Image.fromarray(img.astype(np.uint8)).resize((512, 512)),
+                             dtype=np.float32)
+        em.frame(img, idx)
+        idx += 1
+        if args.max_frames and idx >= args.max_frames:
+            break
+        wait = args.cadence_ms / 1000.0 - (time.time() - t0)
+        if wait > 0:
+            time.sleep(wait)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

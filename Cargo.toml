@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rolling-substrate-core",
+    "crates/harbor-watch",
+    "crates/tellstream",
+]

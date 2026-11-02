@@ -1,0 +1,188 @@
+//! Live-wrapper tests:
+//! 1. parity — LivePipeline (frame-at-a-time) vs the batch
+//!    harbor-watch pipeline on the synthetic fixture: identical
+//!    verdicts. "The live cascade is the wave-3 cascade" is a tested
+//!    claim.
+//! 2. ledger — the four ledger files are written with the required
+//!    keys, and verdict events carry nonzero lineage.
+//! 3. service — the full service loop driven through its ingest
+//!    interface (a `cat` of records + frame_end controls), with a
+//!    stub rack health endpoint: frames processed, the fixture's
+//!    cut published as an event, rack lifecycle untouched (we did
+//!    not start it, so we must not stop it).
+
+use tellstream::config::Config;
+use tellstream::ledger::Ledger;
+use tellstream::live::LivePipeline;
+use tellstream::service;
+use harbor_watch::fixture;
+use harbor_watch::pipeline::{run_records, Config as PipeConfig};
+use harbor_watch::record::record_to_json;
+use std::collections::BTreeMap;
+use std::io::Write;
+
+fn tempdir(tag: &str) -> String {
+    let d = std::env::temp_dir().join(format!(
+        "tellstream-test-{tag}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d.to_string_lossy().to_string()
+}
+
+#[test]
+fn live_matches_batch_on_fixture() {
+    let fx = fixture::generate(128, 7);
+    let cfg = PipeConfig::default();
+    let batch = run_records(&fx.records, cfg.clone());
+
+    let mut by_frame: BTreeMap<u32, Vec<harbor_watch::record::InputRecord>> = BTreeMap::new();
+    for r in &fx.records {
+        by_frame.entry(r.frame).or_default().push(r.clone());
+    }
+    let mut live = LivePipeline::new(fx.dim, cfg);
+    let mut live_tiles = Vec::new();
+    let mut live_frames = Vec::new();
+    for (frame, recs) in by_frame {
+        let out = live.process_frame(frame, recs);
+        live_tiles.extend(out.tiles);
+        live_frames.push(out.verdict);
+    }
+
+    assert_eq!(live_tiles.len(), batch.tiles.len());
+    for (a, b) in live_tiles.iter().zip(batch.tiles.iter()) {
+        assert_eq!(a.frame, b.frame);
+        assert_eq!(a.tile, b.tile);
+        assert_eq!(a.changed, b.changed, "frame {} tile {}", a.frame, a.tile);
+        assert_eq!(a.changed_raw, b.changed_raw);
+        assert_eq!(a.stale, b.stale);
+        assert_eq!(a.lineage_mask, b.lineage_mask);
+        match (a.smoothed_score, b.smoothed_score) {
+            (Some(x), Some(y)) => assert!((x - y).abs() < 1e-9),
+            (None, None) => {}
+            other => panic!("score mismatch: {other:?}"),
+        }
+    }
+    for (a, b) in live_frames.iter().zip(batch.frames.iter()) {
+        assert_eq!(a.changed, b.changed);
+        assert_eq!(a.changed_tiles, b.changed_tiles);
+    }
+    // And the fixture's ground truth still holds through the live path:
+    let cut: Vec<_> = live_frames
+        .iter()
+        .filter(|f| f.changed)
+        .map(|f| (f.frame, f.changed_tiles.clone()))
+        .collect();
+    assert_eq!(cut.len(), 1, "exactly one changed frame expected: {cut:?}");
+    assert_eq!(cut[0].0, fixture::CUT_FRAME);
+    assert_eq!(cut[0].1, fixture::CUT_TILES.to_vec());
+}
+
+#[test]
+fn ledger_files_and_lineage() {
+    let dir = tempdir("ledger");
+    let mut ledger = Ledger::open(&dir, "test-stream", 0.25, 0.1, false).unwrap();
+    let fx = fixture::generate(64, 7);
+    let mut live = LivePipeline::new(fx.dim, PipeConfig::default());
+    let mut by_frame: BTreeMap<u32, Vec<_>> = BTreeMap::new();
+    for r in &fx.records {
+        by_frame.entry(r.frame).or_default().push(r.clone());
+    }
+    let now = tellstream::ledger::epoch_us();
+    for (frame, recs) in by_frame {
+        let n = recs.len() as u64;
+        let out = live.process_frame(frame, recs);
+        let emb_ms: Vec<f64> = (0..n).map(|_| 173.0).collect();
+        ledger.record_frame(&out, now, 16, n, &emb_ms, 0).unwrap();
+    }
+    let state = std::fs::read_to_string(format!("{dir}/state.txt")).unwrap();
+    assert!(state.contains("embeds_spent_s"), "{state}");
+    assert!(state.contains("coverage"), "{state}");
+    assert!(state.contains("embed_everything_estimate_s"), "{state}");
+    let health = std::fs::read_to_string(format!("{dir}/health.txt")).unwrap();
+    assert!(health.contains("embed_ms_p50 = 173"), "{health}");
+    assert!(health.contains("embed_ms_p99"), "{health}");
+    let lens = std::fs::read_to_string(format!("{dir}/lens.txt")).unwrap();
+    assert!(lens.contains("tile_score_ema"), "{lens}");
+    let events = std::fs::read_to_string(format!("{dir}/events.jsonl")).unwrap();
+    let verdicts: Vec<&str> = events
+        .lines()
+        .filter(|l| l.contains("\"kind\":\"verdict\""))
+        .collect();
+    assert_eq!(verdicts.len(), 1, "only the cut frame publishes: {events}");
+    assert!(
+        verdicts[0].contains("\"lineage_mask\":31"),
+        "{}",
+        verdicts[0]
+    );
+    assert!(
+        verdicts[0].contains("verdict_latency_ms"),
+        "{}",
+        verdicts[0]
+    );
+}
+
+/// A one-shot HTTP responder that answers 200 to everything: stands
+/// in for the rack's /health so the service loop can run in tests
+/// without a rack. (Embeds come from the records, not the rack —
+/// the rack is the ingest's dependency, the service only gates on
+/// its health.)
+fn stub_rack() -> String {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for mut s in listener.incoming().flatten() {
+            let mut buf = [0u8; 512];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[test]
+fn service_end_to_end_via_ingest_interface() {
+    let fx = fixture::generate(128, 7);
+    let dir = tempdir("service");
+    let recs_path = format!("{dir}/records.jsonl");
+    let now = tellstream::ledger::epoch_us();
+    {
+        let mut f = std::fs::File::create(&recs_path).unwrap();
+        let mut by_frame: BTreeMap<u32, Vec<_>> = BTreeMap::new();
+        for r in &fx.records {
+            by_frame.entry(r.frame).or_default().push(r);
+        }
+        for (frame, recs) in &by_frame {
+            for r in recs {
+                writeln!(f, "{}", record_to_json(r)).unwrap();
+            }
+            writeln!(
+                f,
+                "{{\"control\":\"frame_end\",\"frame\":{frame},\"t_capture_us\":{now},\"nominated\":16,\"gate_diff\":3.0}}"
+            )
+            .unwrap();
+        }
+    }
+    let cfg = Config {
+        stream_id: "test-stream".into(),
+        ledger_dir: format!("{dir}/ledger"),
+        ingest_cmd: format!("cat {recs_path}"),
+        embed_url: stub_rack(),
+        embedder_autostart: false,
+        stop_embedder_on_exit: true,
+        max_frames: fixture::FRAMES,
+        ..Config::default()
+    };
+    let summary = service::run(&cfg).expect("service run");
+    assert_eq!(summary.frames, fixture::FRAMES as u64);
+    assert_eq!(summary.events, 1, "only the cut publishes");
+    assert!(!summary.embedder_started_by_me);
+    assert!(!summary.embedder_stopped_by_me);
+    let events = std::fs::read_to_string(format!("{dir}/ledger/events.jsonl")).unwrap();
+    assert!(events.contains("\"frame\":4"), "{events}");
+    assert!(events.contains("\"changed_tiles\":[3, 7, 11]"), "{events}");
+    let health = std::fs::read_to_string(format!("{dir}/ledger/health.txt")).unwrap();
+    assert!(health.contains("embedder = up"), "{health}");
+}

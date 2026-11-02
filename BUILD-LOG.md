@@ -1,0 +1,95 @@
+# BUILD-LOG — extraction of the change-ledger core
+
+The process record of the extraction build, written as it happens:
+decisions and their reasons, dead ends, deviations, numbers.
+Source of truth for scope: `docs/EXTRACTION-PLAN.md` in the origin
+repo (SI-Thor/rolling-perception, private), §1/§2 (the IN list and
+the dependency surgery) and §10 (Casey's five rulings, 2026-11-02):
+
+1. The standalone tool gets a standalone name. Working title here:
+   **`tellstream`** — a placeholder Casey has not approved; the code
+   is structured so a rename is one search-replace of `tellstream`
+   (plus the crate directory name).
+2. NEW repo, clean history. This repo's first commit is the
+   extraction; nothing inherits the origin history.
+3. Restrictive-licence parts are never incorporated: the seam
+   ships, the docs explain how to move the best part in under the
+   user's own terms, the shipped default path is licence-clean.
+   I-JEPA weights are never bundled or downloaded by this repo.
+4. Grid is configurable; 4x4 is the default, and its measured
+   rationale ships in `docs/GRID.md`.
+5. Licence: MIT OR Apache-2.0 dual, as in the origin tree.
+
+Constraints honoured throughout: no GitHub operations (local git
+only; publication is a later, separately gated step); the origin
+staging tree is read-only source; the two ruled-out options
+(archived embeddings, change-frame snapshots) are not built.
+
+## Slice 1 — extraction + embedder seam (2026-11-02)
+
+- Copied, unmodified, from the origin tree:
+  `crates/rolling-substrate-core` (whole crate — rings, sheaf,
+  SPSC, lineage, gating), `crates/harbor-watch` (record, pipeline,
+  rng, fixture, ablation, its integration tests and 1280-dim
+  fixture files), `slice1/core` → `crates/tellstream` (src, tests,
+  ingest, fixtures 3.3 MB, prove_fixtures.py, test-server.py).
+  `harbor-watch/src/main.rs` (the wave-3 file driver bin) was NOT
+  carried: the IN list names the library modules; the driver was a
+  lane tool for the origin repo's experiments. The library is the
+  reusable surface.
+- Licences copied from the origin root: LICENSE, LICENSE-MIT,
+  LICENSE-APACHE.
+- Renames: `confluence-watch` → `tellstream` (package, binary,
+  library crate `confluence_watch` → `tellstream`), test tempdirs,
+  env overrides `CONFLUENCE_*` → `TELLSTREAM_*` (fresh tool, no
+  legacy readers; the old names are not aliased in code — the
+  config-file keys for the embedder ARE aliased for one release,
+  per plan §2.2, because config files are technician-edited text
+  that outlives binaries).
+- `service.rs`: the systemctl rack lifecycle is deleted. Lifecycle
+  is `embedder_start_cmd` / `embedder_stop_cmd` shell strings,
+  empty by default (start nothing, stop nothing). Health is an
+  optional configured URL (default: `{embed_url origin}/health`);
+  with no URL the run makes no external check — "no working
+  embedder, no run" survives as: a configured health URL that
+  stays down is a startup error naming the URL.
+- `config.rs`: `rack_url` → `embed_url` (no default — the origin
+  default dialled the fleet rack's port), `rack_autostart` →
+  `embedder_autostart`, `stop_rack_on_exit` →
+  `stop_embedder_on_exit`; old keys aliased for one release.
+  Ledger state/health lines renamed `rack =` → `embedder =`.
+- `ingest/ingest.py`: `Emitter` now takes an embedder object
+  behind a small seam — `embed(tile) -> (vector, embed_ms)` —
+  with three adapters: `HttpEmbedder` (URL, multipart field,
+  response key all from CLI config), `JevRackEmbedder` (the
+  fleet rack, a subclass carrying only its URL layout), and
+  `HashEmbedder`, the built-in **test double** (SHA-256-expanded
+  pseudo-embedding, unit-normalised; labelled in code, CLI help
+  and docs as NOT a perception model). The hardcoded
+  `assert len == 1280` became `embed_dim` config, verified once
+  by a startup probe embed. `prove_fixtures.py` now stubs the
+  same seam with a recorder adapter instead of monkey-patching
+  `Emitter.embed`. Ingest Python deps declared in
+  `crates/tellstream/requirements.txt` (numpy, requests, Pillow).
+- One origin defect fixed in passing: `prove_fixtures.py`
+  asserted fixture paths must not contain `/home/` — a condition
+  no checkout under a home directory can satisfy, including the
+  origin author's own. The assertion now checks the real
+  invariant: default fixtures resolve inside the crate, relative
+  to the script.
+- Also landed here (consumed by slice 2): ingest stamps every
+  frame_end with `frame_hash` (SHA-256 over a 32x32 downsample)
+  and `frame_repeat` (byte-identical to the previous frame).
+
+Slice-1 verification (this machine, debug build):
+- `cargo test --workspace`: **66 passed, 0 failed** (substrate
+  55 incl. property suites, harbor-watch 8, tellstream 3
+  integration — parity / ledger / service-interface all green
+  through the surgery).
+- `prove_fixtures.py`: ALL PASS (gate layer: baseline 16, cut
+  16/16, object exactly {5,6}, drift none, wave-3 C landings
+  16/16).
+- End-to-end through the CLI with the test double: 18 staged
+  frames → **34 embeds**, verdict frame 4 = 16/16 tiles, frame 7
+  = exactly {5,6}, drift silent, lineage 31, spend ratio
+  **0.1181** — the plan §5 P3 numbers, reproduced cold.

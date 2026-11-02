@@ -1,0 +1,10 @@
+[package]
+name = "harbor-watch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "The change-detection cascade library: perceive -> decide -> direct -> refine (one Laplacian step over the tile grid) -> publish, carried on rolling-substrate-core rings at full embedding width. Embeddings are opaque vectors to this crate; which model produced them is the embedder seam's business, not the cascade's."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rolling-substrate-core = { path = "../rolling-substrate-core" }
