@@ -37,10 +37,11 @@
 //! substrate's proven property (its own multi-producer tests), not
 //! something this lane needs to re-claim.
 
-use crate::record::{InputRecord, GRID, TILES};
+use crate::record::{Grid, InputRecord};
 use rolling_substrate_core::sheaf::SheafGraph;
 use rolling_substrate_core::substrate::FluidSubstrateBuffer;
 use std::collections::BTreeMap;
+use std::fmt;
 
 pub const NODE_PERCEIVE: usize = 0;
 pub const NODE_DECIDE: usize = 1;
@@ -57,6 +58,10 @@ pub struct Config {
     pub alpha: f64,
     /// How many most-changed tiles the director marks per frame.
     pub focus_k: usize,
+    /// Tile grid over the frame (default 4×4 — the measured
+    /// configuration; see docs/GRID.md). Tile numbers in every
+    /// verdict are row-major cells of this grid.
+    pub grid: Grid,
 }
 
 impl Default for Config {
@@ -65,9 +70,48 @@ impl Default for Config {
             threshold: 0.25,
             alpha: 0.1,
             focus_k: 4,
+            grid: Grid::default(),
         }
     }
 }
+
+/// Why a run refused its input (gap G2: caller errors are typed
+/// refusals, never panics — a malformed record stream must not be
+/// able to crash a long-running watch).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PipelineError {
+    /// `run_records` was given no records to size the pipeline from.
+    EmptyRecords,
+    /// A record's embedding width differs from the pipeline's.
+    DimMismatch {
+        seq: u64,
+        expected: usize,
+        got: usize,
+    },
+    /// A record names a tile outside the configured grid.
+    TileOutOfGrid { tile: u32, tiles: usize },
+    /// The pipeline was built with a zero embedding dimension.
+    ZeroDim,
+}
+
+impl fmt::Display for PipelineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PipelineError::EmptyRecords => {
+                write!(f, "run_records needs at least one record")
+            }
+            PipelineError::DimMismatch { seq, expected, got } => write!(
+                f,
+                "record seq {seq} has dim {got}, pipeline built for {expected}"
+            ),
+            PipelineError::TileOutOfGrid { tile, tiles } => {
+                write!(f, "tile {tile} out of grid ({tiles} tiles)")
+            }
+            PipelineError::ZeroDim => write!(f, "pipeline dimension must be > 0"),
+        }
+    }
+}
+impl std::error::Error for PipelineError {}
 
 #[derive(Debug, Clone)]
 pub struct TileVerdict {
@@ -117,21 +161,27 @@ pub struct RunOutput {
     pub decide_dim: usize,
 }
 
-/// 4×4 grid adjacency (right + down edges), tiles as nodes.
-pub fn grid_graph() -> SheafGraph {
+/// Grid adjacency (right + down edges) for an arbitrary grid,
+/// tiles as nodes, numbered row-major.
+pub fn grid_graph_for(grid: Grid) -> SheafGraph {
     let mut edges = Vec::new();
-    for r in 0..GRID {
-        for c in 0..GRID {
-            let t = r * GRID + c;
-            if c + 1 < GRID {
+    for r in 0..grid.rows {
+        for c in 0..grid.cols {
+            let t = grid.tile_at(r, c);
+            if c + 1 < grid.cols {
                 edges.push((t, t + 1));
             }
-            if r + 1 < GRID {
-                edges.push((t, t + GRID));
+            if r + 1 < grid.rows {
+                edges.push((t, t + grid.cols));
             }
         }
     }
-    SheafGraph::from_edges(TILES, edges)
+    SheafGraph::from_edges(grid.tiles(), edges)
+}
+
+/// 4×4 grid adjacency (right + down edges), tiles as nodes.
+pub fn grid_graph() -> SheafGraph {
+    grid_graph_for(Grid::default())
 }
 
 pub struct Pipeline {
@@ -143,21 +193,29 @@ pub struct Pipeline {
     publish: FluidSubstrateBuffer,
     graph: SheafGraph,
     dim: usize,
+    tiles: usize,
 }
 
 impl Pipeline {
     pub fn new(dim: usize, cfg: Config) -> Self {
-        assert!(dim > 0);
+        assert!(dim > 0, "pipeline dimension must be > 0");
+        let tiles = cfg.grid.tiles();
         Self {
             ingest: FluidSubstrateBuffer::new(64, dim),
             decide: FluidSubstrateBuffer::new(64, dim + 1),
-            focus_ring: FluidSubstrateBuffer::new(16, TILES),
-            score_ring: FluidSubstrateBuffer::new(16, TILES),
+            focus_ring: FluidSubstrateBuffer::new(16, tiles),
+            score_ring: FluidSubstrateBuffer::new(16, tiles),
             publish: FluidSubstrateBuffer::new(64, 2),
-            graph: grid_graph(),
+            graph: grid_graph_for(cfg.grid),
             dim,
+            tiles,
             cfg,
         }
+    }
+
+    /// The configured tile grid.
+    pub fn grid(&self) -> Grid {
+        self.cfg.grid
     }
 
     pub fn ingest_dim(&self) -> usize {
@@ -167,36 +225,42 @@ impl Pipeline {
         self.decide.dimension()
     }
 
-    pub fn run(self, records: &[InputRecord]) -> RunOutput {
+    pub fn run(self, records: &[InputRecord]) -> Result<RunOutput, PipelineError> {
+        let tiles = self.tiles;
         // Group by frame, ascending; tiles ascending within a frame.
+        // Caller errors are refused, typed (gap G2) — never panics.
         let mut by_frame: BTreeMap<u32, Vec<&InputRecord>> = BTreeMap::new();
         for r in records {
-            assert_eq!(
-                r.embedding.len(),
-                self.dim,
-                "record seq {} has dim {}, pipeline built for {}",
-                r.seq,
-                r.embedding.len(),
-                self.dim
-            );
-            assert!((r.tile as usize) < TILES, "tile {} out of grid", r.tile);
+            if r.embedding.len() != self.dim {
+                return Err(PipelineError::DimMismatch {
+                    seq: r.seq,
+                    expected: self.dim,
+                    got: r.embedding.len(),
+                });
+            }
+            if (r.tile as usize) >= tiles {
+                return Err(PipelineError::TileOutOfGrid {
+                    tile: r.tile,
+                    tiles,
+                });
+            }
             by_frame.entry(r.frame).or_default().push(r);
         }
 
         // Lens state: last published embedding + score per tile.
-        let mut prev_emb: Vec<Option<Vec<f32>>> = vec![None; TILES];
-        let mut last_score: Vec<Option<f64>> = vec![None; TILES];
-        let mut last_arrival: Vec<u64> = vec![0; TILES];
-        let mut last_diff: Vec<Option<f64>> = vec![None; TILES];
+        let mut prev_emb: Vec<Option<Vec<f32>>> = vec![None; tiles];
+        let mut last_score: Vec<Option<f64>> = vec![None; tiles];
+        let mut last_arrival: Vec<u64> = vec![0; tiles];
+        let mut last_diff: Vec<Option<f64>> = vec![None; tiles];
 
         let mut tiles_out: Vec<TileVerdict> = Vec::new();
         let mut frames_out: Vec<FrameVerdict> = Vec::new();
 
         for (frame, mut recs) in by_frame {
             recs.sort_by_key(|r| r.tile);
-            let mut raw: Vec<Option<f64>> = vec![None; TILES];
-            let mut fresh: Vec<bool> = vec![false; TILES];
-            let mut lineage_of: Vec<u64> = vec![0; TILES];
+            let mut raw: Vec<Option<f64>> = vec![None; tiles];
+            let mut fresh: Vec<bool> = vec![false; tiles];
+            let mut lineage_of: Vec<u64> = vec![0; tiles];
 
             for r in &recs {
                 let t = r.tile as usize;
@@ -240,19 +304,19 @@ impl Pipeline {
 
             // Score vector for refine: raw where fresh, last known
             // where stale, 0 where never seen.
-            let mut scores: Vec<f64> = (0..TILES)
+            let mut scores: Vec<f64> = (0..tiles)
                 .map(|t| raw[t].or(last_score[t]).unwrap_or(0.0))
                 .collect();
 
             // ---- direct: top-k most-changed tiles are the focus
-            let mut ranked: Vec<usize> = (0..TILES).collect();
+            let mut ranked: Vec<usize> = (0..tiles).collect();
             ranked.sort_by(|&a, &b| {
                 scores[b]
                     .partial_cmp(&scores[a])
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then(a.cmp(&b))
             });
-            let focus: Vec<u32> = ranked[..self.cfg.focus_k.min(TILES)]
+            let focus: Vec<u32> = ranked[..self.cfg.focus_k.min(tiles)]
                 .iter()
                 .map(|&t| t as u32)
                 .collect();
@@ -281,7 +345,7 @@ impl Pipeline {
 
             // ---- publish: per-tile verdicts through the publish ring
             let mut frame_changed_tiles: Vec<u32> = Vec::new();
-            for t in 0..TILES {
+            for t in 0..tiles {
                 let smoothed = if raw[t].is_some() || last_score[t].is_some() {
                     Some(scores[t])
                 } else {
@@ -341,21 +405,98 @@ impl Pipeline {
             });
         }
 
-        RunOutput {
+        Ok(RunOutput {
             tiles: tiles_out,
             frames: frames_out,
             dim: self.dim,
             ingest_dim: self.ingest.dimension(),
             decide_dim: self.decide.dimension(),
-        }
+        })
     }
 }
 
 /// Convenience: build a pipeline sized from the first record and run.
-pub fn run_records(records: &[InputRecord], cfg: Config) -> RunOutput {
-    let dim = records
-        .first()
-        .map(|r| r.embedding.len())
-        .expect("run_records needs at least one record");
-    Pipeline::new(dim, cfg).run(records)
+pub fn run_records(records: &[InputRecord], cfg: Config) -> Result<RunOutput, PipelineError> {
+    let first = records.first().ok_or(PipelineError::EmptyRecords)?;
+    if first.embedding.is_empty() {
+        return Err(PipelineError::ZeroDim);
+    }
+    Pipeline::new(first.embedding.len(), cfg).run(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::Grid;
+
+    fn rec(frame: u32, tile: u32, emb: Vec<f32>) -> InputRecord {
+        InputRecord {
+            seq: 0,
+            frame,
+            tile,
+            t_arrival_us: 0,
+            diff_score: 0.0,
+            embedding: emb,
+        }
+    }
+
+    #[test]
+    fn empty_input_is_refused_typed() {
+        assert_eq!(
+            run_records(&[], Config::default()).unwrap_err(),
+            PipelineError::EmptyRecords
+        );
+    }
+
+    #[test]
+    fn dim_mismatch_is_refused_not_panicked() {
+        let recs = vec![rec(0, 0, vec![0.0; 8]), rec(0, 1, vec![0.0; 4])];
+        match run_records(&recs, Config::default()) {
+            Err(PipelineError::DimMismatch {
+                expected: 8,
+                got: 4,
+                ..
+            }) => {}
+            other => panic!("expected DimMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tile_outside_the_grid_is_refused_not_panicked() {
+        let recs = vec![rec(0, 16, vec![0.0; 8])];
+        match run_records(&recs, Config::default()) {
+            Err(PipelineError::TileOutOfGrid {
+                tile: 16,
+                tiles: 16,
+            }) => {}
+            other => panic!("expected TileOutOfGrid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_custom_grid_runs_and_addresses_its_own_tiles() {
+        // 2x2 grid, 2 frames; in frame 1 tile 0's vector flips to a
+        // near-orthogonal one: exactly tile 0 must publish changed.
+        let cfg = Config {
+            grid: Grid::new(2, 2).unwrap(),
+            ..Config::default()
+        };
+        let a = vec![1.0, 0.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0, 0.0];
+        let mut recs = Vec::new();
+        for f in 0..2u32 {
+            for t in 0..4u32 {
+                let emb = if f == 1 && t == 0 {
+                    b.clone()
+                } else {
+                    a.clone()
+                };
+                recs.push(rec(f, t, emb));
+            }
+        }
+        let out = run_records(&recs, cfg).unwrap();
+        assert_eq!(out.tiles.len(), 8, "2 frames x 4 tiles");
+        let f1 = &out.frames[1];
+        assert_eq!(f1.changed_tiles, vec![0]);
+    }
 }

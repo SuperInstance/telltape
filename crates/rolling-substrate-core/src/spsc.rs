@@ -488,7 +488,7 @@ impl<T> Consumer<T> {
                     // written slot (sequence behind us, difference
                     // wrapped near 2^64) from reading as overwritten.
                     let diff = seq.wrapping_sub(m + 1);
-                    if diff != 0 && diff.is_multiple_of(inner.capacity) && diff < (1u64 << 63) {
+                    if diff != 0 && diff % inner.capacity == 0 && diff < (1u64 << 63) {
                         // No release store here: unlike DropNewest,
                         // this slot holds a *newer* live generation
                         // whose state our store would clobber.

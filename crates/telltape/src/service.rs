@@ -25,15 +25,72 @@
 //! (the ingest's in-process test double, or an embedder managed
 //! elsewhere) no external check is possible and none is made.
 
-use crate::config::Config;
+use crate::config::{Config, ConfigError};
 use crate::ledger::{epoch_us, Ledger};
 use crate::live::LivePipeline;
-use harbor_watch::pipeline::Config as PipeConfig;
+use harbor_watch::pipeline::{Config as PipeConfig, PipelineError};
 use harbor_watch::record::{parse_record, InputRecord};
+use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+/// Why a service run failed (gap G2: typed at the crate's public
+/// surface — no `Result<_, String>` remains).
+#[derive(Debug)]
+pub enum ServiceError {
+    /// The ledger directory could not be opened or written.
+    Ledger(std::io::Error),
+    /// Bad configuration (including an invalid grid).
+    Config(ConfigError),
+    /// The configured embedder never became healthy.
+    EmbedderUnhealthy {
+        url: String,
+        autostart: bool,
+        start_cmd_set: bool,
+    },
+    /// The ingest command could not be spawned or read.
+    Ingest(std::io::Error),
+    /// The cascade refused a frame (bad record in the stream).
+    Pipeline(PipelineError),
+}
+
+impl fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ServiceError::Ledger(e) => write!(f, "ledger: {e}"),
+            ServiceError::Config(e) => write!(f, "config: {e}"),
+            ServiceError::EmbedderUnhealthy {
+                url,
+                autostart,
+                start_cmd_set,
+            } => write!(
+                f,
+                "embedder not healthy at {url} (embedder_autostart={autostart}, start_cmd {})",
+                if *start_cmd_set { "set" } else { "unset" }
+            ),
+            ServiceError::Ingest(e) => write!(f, "ingest: {e}"),
+            ServiceError::Pipeline(e) => write!(f, "pipeline: {e}"),
+        }
+    }
+}
+impl std::error::Error for ServiceError {}
+impl From<std::io::Error> for ServiceError {
+    fn from(e: std::io::Error) -> Self {
+        ServiceError::Ledger(e)
+    }
+}
+impl From<ConfigError> for ServiceError {
+    fn from(e: ConfigError) -> Self {
+        ServiceError::Config(e)
+    }
+}
+impl From<PipelineError> for ServiceError {
+    fn from(e: PipelineError) -> Self {
+        ServiceError::Pipeline(e)
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct Summary {
@@ -127,15 +184,16 @@ fn run_shell_cmd(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn run(cfg: &Config) -> Result<Summary, String> {
+pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
+    let grid = cfg.grid()?;
     let mut ledger = Ledger::open(
         &cfg.ledger_dir,
         &cfg.stream_id,
         cfg.threshold,
         cfg.alpha,
         cfg.soak,
-    )
-    .map_err(|e| format!("ledger open: {e}"))?;
+        grid,
+    )?;
     ledger
         .service_event("start", &format!("stream {} starting", cfg.stream_id))
         .ok();
@@ -183,16 +241,11 @@ pub fn run(cfg: &Config) -> Result<Summary, String> {
     ledger.embedder_started_by_me = embedder_started_by_me;
     ledger.write_all().ok();
     if !up {
-        let url = health_url.as_deref().unwrap_or("");
-        return Err(format!(
-            "embedder not healthy at {url} (embedder_autostart={}, start_cmd {})",
-            cfg.embedder_autostart,
-            if cfg.embedder_start_cmd.is_empty() {
-                "unset"
-            } else {
-                "set"
-            }
-        ));
+        return Err(ServiceError::EmbedderUnhealthy {
+            url: health_url.as_deref().unwrap_or("").to_string(),
+            autostart: cfg.embedder_autostart,
+            start_cmd_set: !cfg.embedder_start_cmd.is_empty(),
+        });
     }
 
     // ---- spawn ingest (or read our own stdin)
@@ -205,7 +258,7 @@ pub fn run(cfg: &Config) -> Result<Summary, String> {
             .arg(&cfg.ingest_cmd)
             .stdout(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("spawn ingest: {e}"))?;
+            .map_err(ServiceError::Ingest)?;
         let out = c.stdout.take().expect("piped stdout");
         child = Some(c);
         Box::new(BufReader::new(out))
@@ -215,6 +268,7 @@ pub fn run(cfg: &Config) -> Result<Summary, String> {
         threshold: cfg.threshold,
         alpha: cfg.alpha,
         focus_k: cfg.focus_k,
+        grid,
     };
     let mut pipeline: Option<LivePipeline> = None;
     let mut prev_frame_hash: Option<String> = None;
@@ -229,9 +283,7 @@ pub fn run(cfg: &Config) -> Result<Summary, String> {
     let mut line = String::new();
     loop {
         line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|e| format!("read ingest: {e}"))?;
+        let n = reader.read_line(&mut line).map_err(ServiceError::Ingest)?;
         if n == 0 {
             break; // ingest EOF: clean end of stream
         }
@@ -308,18 +360,15 @@ pub fn run(cfg: &Config) -> Result<Summary, String> {
                     let emb_ms = std::mem::take(&mut pending_embed_ms);
                     let embedded = recs.len() as u64;
                     let pending_now = frames_received - frames_processed - 1;
-                    let out = p.process_frame(frame, recs);
-                    if let Some(lat) = ledger
-                        .record_frame(
-                            &out,
-                            t_capture_us,
-                            nominated,
-                            embedded,
-                            &emb_ms,
-                            pending_now,
-                        )
-                        .map_err(|e| format!("ledger write: {e}"))?
-                    {
+                    let out = p.process_frame(frame, recs)?;
+                    if let Some(lat) = ledger.record_frame(
+                        &out,
+                        t_capture_us,
+                        nominated,
+                        embedded,
+                        &emb_ms,
+                        pending_now,
+                    )? {
                         verdict_latencies.push(lat);
                     }
                 } else {

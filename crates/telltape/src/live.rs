@@ -11,11 +11,16 @@
 //! fixture through both forms and asserts identical verdicts, so
 //! "identical" is a tested claim, not a comment.
 
-use harbor_watch::pipeline::{grid_graph, Config, FrameVerdict, TileVerdict};
+use harbor_watch::pipeline::{grid_graph_for, Config, FrameVerdict, PipelineError, TileVerdict};
 use harbor_watch::pipeline::{NODE_DECIDE, NODE_DIRECT, NODE_PERCEIVE, NODE_PUBLISH, NODE_REFINE};
-use harbor_watch::record::{InputRecord, TILES};
+use harbor_watch::record::{Grid, InputRecord};
 use rolling_substrate_core::sheaf::SheafGraph;
 use rolling_substrate_core::substrate::FluidSubstrateBuffer;
+
+/// Why a frame was refused (gap G2): the same typed refusals as
+/// the batch pipeline. A bad record in a live stream is dropped
+/// with a reason — it never panics the watch.
+pub type ProcessError = PipelineError;
 
 pub struct LivePipeline {
     cfg: Config,
@@ -26,6 +31,7 @@ pub struct LivePipeline {
     publish: FluidSubstrateBuffer,
     graph: SheafGraph,
     dim: usize,
+    tiles: usize,
     prev_emb: Vec<Option<Vec<f32>>>,
     last_score: Vec<Option<f64>>,
     last_arrival: Vec<u64>,
@@ -50,20 +56,22 @@ pub struct FrameOutput {
 
 impl LivePipeline {
     pub fn new(dim: usize, cfg: Config) -> Self {
-        assert!(dim > 0);
+        assert!(dim > 0, "pipeline dimension must be > 0");
+        let tiles = cfg.grid.tiles();
         Self {
             ingest: FluidSubstrateBuffer::new(64, dim),
             decide: FluidSubstrateBuffer::new(64, dim + 1),
-            focus_ring: FluidSubstrateBuffer::new(16, TILES),
-            score_ring: FluidSubstrateBuffer::new(16, TILES),
+            focus_ring: FluidSubstrateBuffer::new(16, tiles),
+            score_ring: FluidSubstrateBuffer::new(16, tiles),
             publish: FluidSubstrateBuffer::new(64, 2),
-            graph: grid_graph(),
+            graph: grid_graph_for(cfg.grid),
             dim,
+            tiles,
             cfg,
-            prev_emb: vec![None; TILES],
-            last_score: vec![None; TILES],
-            last_arrival: vec![0; TILES],
-            last_diff: vec![None; TILES],
+            prev_emb: vec![None; tiles],
+            last_score: vec![None; tiles],
+            last_arrival: vec![0; tiles],
+            last_diff: vec![None; tiles],
         }
     }
 
@@ -71,27 +79,50 @@ impl LivePipeline {
         self.dim
     }
 
+    /// The configured tile grid.
+    pub fn grid(&self) -> Grid {
+        self.cfg.grid
+    }
+
+    /// Tile count of the configured grid.
+    pub fn tiles(&self) -> usize {
+        self.tiles
+    }
+
     /// Process one frame's records (any subset of tiles — tiles with
     /// no record are stale this frame). Mirrors one iteration of the
-    /// batch pipeline's frame loop exactly.
-    pub fn process_frame(&mut self, frame: u32, mut recs: Vec<InputRecord>) -> FrameOutput {
+    /// batch pipeline's frame loop exactly. Caller errors (a record
+    /// of the wrong width, a tile outside the grid) are refused
+    /// typed, before any state is touched (gap G2).
+    pub fn process_frame(
+        &mut self,
+        frame: u32,
+        mut recs: Vec<InputRecord>,
+    ) -> Result<FrameOutput, ProcessError> {
+        for r in &recs {
+            if r.embedding.len() != self.dim {
+                return Err(PipelineError::DimMismatch {
+                    seq: r.seq,
+                    expected: self.dim,
+                    got: r.embedding.len(),
+                });
+            }
+            if (r.tile as usize) >= self.tiles {
+                return Err(PipelineError::TileOutOfGrid {
+                    tile: r.tile,
+                    tiles: self.tiles,
+                });
+            }
+        }
+        let tiles = self.tiles;
         let t0 = std::time::Instant::now();
         recs.sort_by_key(|r| r.tile);
-        let mut raw: Vec<Option<f64>> = vec![None; TILES];
-        let mut fresh: Vec<bool> = vec![false; TILES];
-        let mut lineage_of: Vec<u64> = vec![0; TILES];
+        let mut raw: Vec<Option<f64>> = vec![None; tiles];
+        let mut fresh: Vec<bool> = vec![false; tiles];
+        let mut lineage_of: Vec<u64> = vec![0; tiles];
 
         for r in &recs {
-            assert_eq!(
-                r.embedding.len(),
-                self.dim,
-                "record frame {} has dim {}, pipeline built for {}",
-                r.frame,
-                r.embedding.len(),
-                self.dim
-            );
             let t = r.tile as usize;
-            assert!(t < TILES, "tile {} out of grid", r.tile);
             // ---- perceive: publish the full embedding to the ring
             let claim = {
                 let mut lease = self.ingest.lease();
@@ -130,20 +161,20 @@ impl LivePipeline {
 
         // Score vector for refine: raw where fresh, last known where
         // stale, 0 where never seen. (Identical to batch.)
-        let mut scores: Vec<f64> = (0..TILES)
+        let mut scores: Vec<f64> = (0..tiles)
             .map(|t| raw[t].or(self.last_score[t]).unwrap_or(0.0))
             .collect();
 
         // ---- direct: top-k most-changed tiles are the focus
         let t1 = std::time::Instant::now();
-        let mut ranked: Vec<usize> = (0..TILES).collect();
+        let mut ranked: Vec<usize> = (0..tiles).collect();
         ranked.sort_by(|&a, &b| {
             scores[b]
                 .partial_cmp(&scores[a])
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.cmp(&b))
         });
-        let focus: Vec<u32> = ranked[..self.cfg.focus_k.min(TILES)]
+        let focus: Vec<u32> = ranked[..self.cfg.focus_k.min(tiles)]
             .iter()
             .map(|&t| t as u32)
             .collect();
@@ -175,9 +206,9 @@ impl LivePipeline {
 
         // ---- publish: per-tile verdicts through the publish ring
         let t3 = std::time::Instant::now();
-        let mut tiles_out: Vec<TileVerdict> = Vec::with_capacity(TILES);
+        let mut tiles_out: Vec<TileVerdict> = Vec::with_capacity(tiles);
         let mut frame_changed_tiles: Vec<u32> = Vec::new();
-        for t in 0..TILES {
+        for t in 0..tiles {
             let smoothed = if raw[t].is_some() || self.last_score[t].is_some() {
                 Some(scores[t])
             } else {
@@ -217,7 +248,7 @@ impl LivePipeline {
         }
         let ms_publish = t3.elapsed().as_secs_f64() * 1e3;
 
-        FrameOutput {
+        Ok(FrameOutput {
             verdict: FrameVerdict {
                 frame,
                 changed: !frame_changed_tiles.is_empty(),
@@ -234,6 +265,6 @@ impl LivePipeline {
                 refine: ms_refine,
                 publish: ms_publish,
             },
-        }
+        })
     }
 }

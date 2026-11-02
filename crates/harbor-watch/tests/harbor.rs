@@ -11,7 +11,7 @@ const DIM: usize = 256; // speed; the 1280 case has its own test below
 
 fn run_fixture() -> (fixture::Fixture, harbor_watch::pipeline::RunOutput) {
     let fx = fixture::generate(DIM, 7);
-    let out = run_records(&fx.records, Config::default());
+    let out = run_records(&fx.records, Config::default()).unwrap();
     (fx, out)
 }
 
@@ -133,7 +133,7 @@ fn jsonl_round_trip() {
 #[test]
 fn full_1280_dimension_is_carried_not_truncated() {
     let fx = fixture::generate(1280, 7);
-    let out = run_records(&fx.records, Config::default());
+    let out = run_records(&fx.records, Config::default()).unwrap();
     assert_eq!(out.dim, 1280);
     assert_eq!(
         out.ingest_dim, 1280,
@@ -156,7 +156,7 @@ fn full_1280_dimension_is_carried_not_truncated() {
 #[test]
 fn changed_strategy_file_stale_tiles_and_compare() {
     let fx = fixture::generate(DIM, 7);
-    let all = run_records(&fx.records, Config::default());
+    let all = run_records(&fx.records, Config::default()).unwrap();
     // Simulate a CHANGED-strategy file: baseline frame complete, after
     // that only records whose cheap diff fired (cuts + the spike).
     let ch_records: Vec<_> = fx
@@ -166,7 +166,7 @@ fn changed_strategy_file_stale_tiles_and_compare() {
         .cloned()
         .collect();
     assert!(ch_records.len() < fx.records.len());
-    let ch = run_records(&ch_records, Config::default());
+    let ch = run_records(&ch_records, Config::default()).unwrap();
     // Stale verdicts exist and are labelled: at frame 4 only the cut
     // tiles have records in the sparse file; their neighbours' verdicts
     // rest on last known scores. (Frames with no records at all — 1, 2,

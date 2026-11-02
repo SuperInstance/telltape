@@ -49,6 +49,12 @@ pub struct Config {
     pub threshold: f64,
     pub alpha: f64,
     pub focus_k: usize,
+    /// Tile grid rows (default 4). Paired with `grid_cols`; the
+    /// ingest must be run with the matching `--grid` value — the
+    /// tile count is the contract between the two halves.
+    pub grid_rows: usize,
+    /// Tile grid columns (default 4).
+    pub grid_cols: usize,
     /// Soak mode: run unattended until the stop file / EOF, appending
     /// precision self-report placeholders to state.txt.
     pub soak: bool,
@@ -73,6 +79,8 @@ impl Default for Config {
             threshold: 0.25,
             alpha: 0.1,
             focus_k: 4,
+            grid_rows: 4,
+            grid_cols: 4,
             soak: false,
             max_frames: 0,
             stop_file: String::new(),
@@ -81,6 +89,13 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The configured tile grid, validated. A bad grid is a
+    /// config error naming the keys, not a runtime surprise.
+    pub fn grid(&self) -> Result<harbor_watch::record::Grid, ConfigError> {
+        harbor_watch::record::Grid::new(self.grid_rows, self.grid_cols)
+            .map_err(|e| ConfigError(format!("grid_rows/grid_cols: {e}")))
+    }
+
     /// The URL whose liveness gates the run, or `None` when no
     /// external embedder check is configured.
     pub fn health_url(&self) -> Option<String> {
@@ -190,6 +205,16 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
     if let Some(v) = num("focus_k")? {
         cfg.focus_k = v as usize;
     }
+    if let Some(v) = num("grid_rows")? {
+        cfg.grid_rows = v as usize;
+    }
+    if let Some(v) = num("grid_cols")? {
+        cfg.grid_cols = v as usize;
+    }
+    // Validate the pair eagerly: a config that cannot run should
+    // fail at load, with the keys named.
+    cfg.grid()?;
+
     if let Some(v) = num("max_frames")? {
         cfg.max_frames = v as u32;
     }
@@ -200,4 +225,71 @@ pub fn load_config(path: &str) -> Result<Config, ConfigError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| ConfigError(format!("cannot read config {path}: {e}")))?;
     parse_config(&text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_config_is_the_documented_defaults() {
+        let c = parse_config("").unwrap();
+        assert_eq!(c.stream_id, "stream0");
+        assert_eq!(c.grid_rows, 4);
+        assert_eq!(c.grid_cols, 4);
+        assert_eq!(c.grid().unwrap().tiles(), 16);
+        assert!(
+            c.embed_url.is_empty(),
+            "no embedder default — see config docs"
+        );
+        assert_eq!(c.health_url(), None);
+    }
+
+    #[test]
+    fn grid_keys_parse_and_validate() {
+        let c = parse_config("grid_rows = 3\ngrid_cols = 5\n").unwrap();
+        assert_eq!(c.grid().unwrap().tiles(), 15);
+        let e = parse_config("grid_rows = 17\n").unwrap_err();
+        assert!(e.0.contains("grid_rows"), "{e}");
+    }
+
+    #[test]
+    fn rack_keys_are_accepted_as_aliases() {
+        let c = parse_config("rack_url = http://127.0.0.1:8077\nrack_autostart = true\n").unwrap();
+        assert_eq!(c.embed_url, "http://127.0.0.1:8077");
+        assert!(c.embedder_autostart);
+        // The new key wins over its alias.
+        let c = parse_config("rack_url = http://old\nembed_url = http://new\n").unwrap();
+        assert_eq!(c.embed_url, "http://new");
+    }
+
+    #[test]
+    fn bad_values_name_the_key() {
+        assert!(parse_config("threshold = abc\n")
+            .unwrap_err()
+            .0
+            .contains("threshold"));
+        assert!(parse_config("soak = maybe\n")
+            .unwrap_err()
+            .0
+            .contains("soak"));
+    }
+
+    #[test]
+    fn health_url_derives_from_the_embed_origin() {
+        let c = parse_config("embed_url = http://127.0.0.1:9000/embed/image\n").unwrap();
+        assert_eq!(
+            c.health_url().as_deref(),
+            Some("http://127.0.0.1:9000/health")
+        );
+        let c = parse_config("embed_url = http://h:9/e\nembed_health_url = http://elsewhere/h\n")
+            .unwrap();
+        assert_eq!(c.health_url().as_deref(), Some("http://elsewhere/h"));
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored_for_forward_compatibility() {
+        let c = parse_config("future_key = yes\nstream_id = s1\n").unwrap();
+        assert_eq!(c.stream_id, "s1");
+    }
 }

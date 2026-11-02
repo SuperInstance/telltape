@@ -32,7 +32,7 @@ fn tempdir(tag: &str) -> String {
 fn live_matches_batch_on_fixture() {
     let fx = fixture::generate(128, 7);
     let cfg = PipeConfig::default();
-    let batch = run_records(&fx.records, cfg.clone());
+    let batch = run_records(&fx.records, cfg.clone()).unwrap();
 
     let mut by_frame: BTreeMap<u32, Vec<harbor_watch::record::InputRecord>> = BTreeMap::new();
     for r in &fx.records {
@@ -42,7 +42,7 @@ fn live_matches_batch_on_fixture() {
     let mut live_tiles = Vec::new();
     let mut live_frames = Vec::new();
     for (frame, recs) in by_frame {
-        let out = live.process_frame(frame, recs);
+        let out = live.process_frame(frame, recs).unwrap();
         live_tiles.extend(out.tiles);
         live_frames.push(out.verdict);
     }
@@ -79,7 +79,15 @@ fn live_matches_batch_on_fixture() {
 #[test]
 fn ledger_files_and_lineage() {
     let dir = tempdir("ledger");
-    let mut ledger = Ledger::open(&dir, "test-stream", 0.25, 0.1, false).unwrap();
+    let mut ledger = Ledger::open(
+        &dir,
+        "test-stream",
+        0.25,
+        0.1,
+        false,
+        harbor_watch::record::Grid::default(),
+    )
+    .unwrap();
     let fx = fixture::generate(64, 7);
     let mut live = LivePipeline::new(fx.dim, PipeConfig::default());
     let mut by_frame: BTreeMap<u32, Vec<_>> = BTreeMap::new();
@@ -89,7 +97,7 @@ fn ledger_files_and_lineage() {
     let now = telltape::ledger::epoch_us();
     for (frame, recs) in by_frame {
         let n = recs.len() as u64;
-        let out = live.process_frame(frame, recs);
+        let out = live.process_frame(frame, recs).unwrap();
         let emb_ms: Vec<f64> = (0..n).map(|_| 173.0).collect();
         ledger.record_frame(&out, now, 16, n, &emb_ms, 0).unwrap();
     }

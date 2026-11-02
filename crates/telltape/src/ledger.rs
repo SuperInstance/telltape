@@ -77,7 +77,11 @@ pub struct Stats {
     pub verdict_latency_ms: Vec<f64>,
     pub period_ms_ema: Option<f64>,
     pub jitter_ms_ema: Option<f64>,
-    pub tile_score_ema: [Option<f64>; 16],
+    /// Per-tile score EMAs, sized to the configured grid.
+    pub tile_score_ema: Vec<Option<f64>>,
+    /// Tile count of the configured grid — the embed-everything
+    /// baseline is per-tile, so it scales with the grid.
+    pub tiles: usize,
     pub last_frame: Option<u32>,
     pub last_frame_wall_us: u64,
     pub frames_pending_max: u64,
@@ -95,7 +99,7 @@ impl Stats {
     /// the observed mean embed latency — the baseline the gate is
     /// saving against.
     pub fn embed_everything_estimate_s(&self) -> f64 {
-        self.frames_seen as f64 * 16.0 * self.mean_embed_ms() / 1000.0
+        self.frames_seen as f64 * self.tiles.max(1) as f64 * self.mean_embed_ms() / 1000.0
     }
     /// The source is frozen when the last `FROZEN_AFTER_REPEATS`
     /// frames were all repeats of one image.
@@ -142,6 +146,9 @@ pub struct Ledger {
     pub threshold: f64,
     pub alpha: f64,
     pub gate_diff: Option<f64>,
+    /// The grid every verdict in this ledger is numbered against.
+    /// Written into lens.txt; a reader must never have to guess it.
+    pub grid: harbor_watch::record::Grid,
 }
 
 impl Ledger {
@@ -151,23 +158,30 @@ impl Ledger {
         threshold: f64,
         alpha: f64,
         soak: bool,
+        grid: harbor_watch::record::Grid,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let events = OpenOptions::new()
             .create(true)
             .append(true)
             .open(format!("{dir}/events.jsonl"))?;
+        let stats = Stats {
+            tiles: grid.tiles(),
+            tile_score_ema: vec![None; grid.tiles()],
+            ..Stats::default()
+        };
         let l = Self {
             dir: dir.to_string(),
             stream_id: stream_id.to_string(),
             events,
-            stats: Stats::default(),
+            stats,
             embedder_up: false,
             embedder_started_by_me: false,
             soak,
             threshold,
             alpha,
             gate_diff: None,
+            grid,
         };
         l.write_all()?;
         Ok(l)
@@ -322,6 +336,7 @@ impl Ledger {
         let s = &self.stats;
         let mut t = String::new();
         t.push_str(&format!("stream_id = {}\n", self.stream_id));
+        t.push_str(&format!("grid = {}\n", self.grid));
         t.push_str(&format!(
             "period_ms = {}\n",
             s.period_ms_ema
@@ -422,5 +437,151 @@ impl Ledger {
             self.embedder_up && s.frames_seen > 0 && !s.source_frozen(),
             epoch_us()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::live::{FrameOutput, StageMs};
+    use harbor_watch::pipeline::{FrameVerdict, TileVerdict};
+    use harbor_watch::record::Grid;
+
+    fn tempdir(tag: &str) -> String {
+        let d = std::env::temp_dir().join(format!("telltape-ledger-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_string_lossy().to_string()
+    }
+
+    fn tile_verdict(tile: u32, changed: bool) -> TileVerdict {
+        TileVerdict {
+            frame: 7,
+            tile,
+            t_arrival_us: 0,
+            driver_diff: None,
+            raw_score: changed.then_some(0.9),
+            smoothed_score: changed.then_some(0.8),
+            changed_raw: changed,
+            changed,
+            focus: changed,
+            stale: !changed,
+            lineage_mask: if changed { 31 } else { 0 },
+        }
+    }
+
+    fn changed_output() -> FrameOutput {
+        FrameOutput {
+            verdict: FrameVerdict {
+                frame: 7,
+                changed: true,
+                changed_tiles: vec![5, 6],
+                focus: vec![5, 6],
+                energy_before: 0.5,
+                energy_after: 0.3,
+                records_in_frame: 2,
+            },
+            tiles: (0..16).map(|t| tile_verdict(t, t == 5 || t == 6)).collect(),
+            stage_ms: StageMs::default(),
+        }
+    }
+
+    #[test]
+    fn percentiles_and_fmt_opt() {
+        assert_eq!(percentiles(&[]), (0.0, 0.0));
+        let (p50, p99) = percentiles(&[10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(p50, 20.0);
+        assert_eq!(p99, 40.0);
+        assert_eq!(fmt_opt(Some(0.5)), "0.5000");
+        assert_eq!(fmt_opt(None), "null");
+    }
+
+    #[test]
+    fn freshness_transitions_and_the_frozen_threshold() {
+        let dir = tempdir("fresh");
+        let mut l = Ledger::open(&dir, "s", 0.25, 0.1, false, Grid::default()).unwrap();
+        assert_eq!(l.stats.freshness(), "unknown");
+        assert_eq!(l.observe_freshness(false), FreshnessTransition::None);
+        assert_eq!(l.stats.freshness(), "live");
+        assert_eq!(l.observe_freshness(true), FreshnessTransition::None);
+        assert!(!l.stats.source_frozen(), "one repeat is not frozen");
+        assert_eq!(l.observe_freshness(true), FreshnessTransition::BecameFrozen);
+        assert_eq!(l.stats.freshness(), "frozen");
+        assert_eq!(l.observe_freshness(true), FreshnessTransition::None);
+        assert_eq!(l.observe_freshness(false), FreshnessTransition::Recovered);
+        assert_eq!(l.stats.frames_novel, 2);
+        assert_eq!(l.stats.frames_repeated, 3);
+    }
+
+    #[test]
+    fn frozen_health_withdraws_meaning_from_silence() {
+        let dir = tempdir("health");
+        let mut l = Ledger::open(&dir, "s", 0.25, 0.1, false, Grid::default()).unwrap();
+        l.embedder_up = true;
+        l.stats.frames_seen = 3;
+        l.observe_freshness(false);
+        let h = l.health_text();
+        assert!(h.contains("freshness = live"), "{h}");
+        assert!(h.contains("silence_meaningful = true"), "{h}");
+        l.observe_freshness(true);
+        l.observe_freshness(true);
+        let h = l.health_text();
+        assert!(h.contains("freshness = frozen"), "{h}");
+        assert!(h.contains("silence_meaningful = false"), "{h}");
+    }
+
+    /// P5 — the verdict row is the format strangers will parse; pin
+    /// it byte-for-byte in the fields that carry meaning.
+    #[test]
+    fn verdict_row_is_the_documented_golden_shape() {
+        let dir = tempdir("golden");
+        let mut l = Ledger::open(&dir, "golden-stream", 0.25, 0.1, false, Grid::default()).unwrap();
+        let out = changed_output();
+        l.record_frame(&out, epoch_us(), 2, 2, &[100.0, 100.0], 0)
+            .unwrap();
+        let events = std::fs::read_to_string(format!("{dir}/events.jsonl")).unwrap();
+        let row = events
+            .lines()
+            .find(|x| x.contains("\"kind\":\"verdict\""))
+            .expect("one verdict row");
+        for needle in [
+            "\"stream\":\"golden-stream\"",
+            "\"frame\":7",
+            "\"changed_tiles\":[5, 6]",
+            "\"focus\":[5, 6]",
+            "\"lineage_mask\":31",
+            "\"embeds_this_frame\":2",
+            "\"energy_before\":0.5000",
+            "\"energy_after\":0.3000",
+            "\"tile\":5,\"raw\":0.9000,\"smoothed\":0.8000,\"changed\":true",
+        ] {
+            assert!(row.contains(needle), "row missing {needle}: {row}");
+        }
+        // A silent frame appends nothing — silence is the default.
+        let mut silent = changed_output();
+        silent.verdict.changed = false;
+        silent.verdict.changed_tiles = vec![];
+        l.record_frame(&silent, epoch_us(), 0, 0, &[], 0).unwrap();
+        let events2 = std::fs::read_to_string(format!("{dir}/events.jsonl")).unwrap();
+        assert_eq!(events2.matches("\"kind\":\"verdict\"").count(), 1);
+    }
+
+    #[test]
+    fn embed_everything_baseline_scales_with_the_grid() {
+        let dir = tempdir("grid");
+        let mut l = Ledger::open(&dir, "s", 0.25, 0.1, true, Grid::new(2, 2).unwrap()).unwrap();
+        let mut out = changed_output();
+        out.tiles = (0..4).map(|t| tile_verdict(t, t == 1)).collect();
+        out.verdict.changed_tiles = vec![1];
+        l.record_frame(&out, epoch_us(), 2, 2, &[100.0, 100.0], 0)
+            .unwrap();
+        // 1 frame x 4 tiles x 100 ms mean = 0.4 s of embed-everything.
+        assert!(l
+            .state_text()
+            .contains("embed_everything_estimate_s = 0.400"));
+        assert!(l.lens_text().contains("grid = 2x2"));
+        assert!(l
+            .state_text()
+            .contains("precision_self_report = placeholder"));
     }
 }

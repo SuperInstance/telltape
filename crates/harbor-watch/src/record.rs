@@ -18,6 +18,54 @@ pub const GRID: usize = 4; // 4x4 tiles
 pub const TILES: usize = GRID * GRID;
 pub const DEFAULT_DIM: usize = 1280; // I-JEPA ViT-H embedding size
 
+/// The tile grid over a frame: `rows` × `cols`, tiles numbered
+/// row-major (tile = row * cols + col). 4×4 is the default — every
+/// measured number this tool ships with (wave 3, slice 1, the
+/// soak) was taken on it; see `docs/GRID.md` for the rationale and
+/// what changing it trades. The grid is a *runtime* value, not a
+/// format constant: every verdict row is interpreted against the
+/// `grid` field of its own ledger's `lens.txt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Grid {
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl Grid {
+    pub fn new(rows: usize, cols: usize) -> Result<Grid, ParseError> {
+        if !(1..=16).contains(&rows) || !(1..=16).contains(&cols) || rows * cols < 2 {
+            return Err(ParseError(format!(
+                "grid {rows}x{cols} out of range: each side must be 1..=16 and the grid needs at least 2 tiles"
+            )));
+        }
+        Ok(Grid { rows, cols })
+    }
+    pub fn tiles(&self) -> usize {
+        self.rows * self.cols
+    }
+    pub fn tile_at(&self, row: usize, col: usize) -> usize {
+        row * self.cols + col
+    }
+    pub fn row_col(&self, tile: usize) -> (usize, usize) {
+        (tile / self.cols, tile % self.cols)
+    }
+}
+
+impl Default for Grid {
+    fn default() -> Self {
+        Grid {
+            rows: GRID,
+            cols: GRID,
+        }
+    }
+}
+
+impl std::fmt::Display for Grid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}x{}", self.rows, self.cols)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct InputRecord {
     pub seq: u64,
@@ -116,4 +164,71 @@ pub fn record_to_json(r: &InputRecord) -> String {
     }
     s.push_str("]}");
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> InputRecord {
+        InputRecord {
+            seq: 3,
+            frame: 2,
+            tile: 5,
+            t_arrival_us: 123_456,
+            diff_score: 0.25,
+            embedding: vec![0.5, -0.25, 1.0],
+        }
+    }
+
+    #[test]
+    fn round_trip_preserves_the_record() {
+        let r = sample();
+        let back = parse_record(&record_to_json(&r)).unwrap();
+        assert_eq!(back.seq, r.seq);
+        assert_eq!(back.frame, r.frame);
+        assert_eq!(back.tile, r.tile);
+        assert_eq!(back.t_arrival_us, r.t_arrival_us);
+        assert!((back.diff_score - r.diff_score).abs() < 1e-6);
+        assert_eq!(back.embedding.len(), 3);
+    }
+
+    #[test]
+    fn missing_embedding_is_a_named_error() {
+        let e = parse_record("{\"seq\":0,\"frame\":0}").unwrap_err();
+        assert!(e.0.contains("embedding"), "{e}");
+    }
+
+    #[test]
+    fn bad_number_is_a_named_error() {
+        let e = parse_record(
+            "{\"seq\":\"x\",\"frame\":0,\"tile\":0,\"t_arrival_us\":0,\"diff_score\":0,\"embedding\":[1]}",
+        )
+        .unwrap_err();
+        assert!(e.0.contains("seq"), "{e}");
+    }
+
+    #[test]
+    fn parse_jsonl_reports_the_line_number() {
+        let good = record_to_json(&sample());
+        let text = format!("{good}\nnot json\n{good}");
+        let e = parse_jsonl(&text).unwrap_err();
+        assert!(e.0.contains("line 2"), "{e}");
+    }
+
+    #[test]
+    fn grid_validation_and_addressing() {
+        assert_eq!(Grid::default().tiles(), 16);
+        assert_eq!(format!("{}", Grid::default()), "4x4");
+        let g = Grid::new(3, 5).unwrap();
+        assert_eq!(g.tiles(), 15);
+        assert_eq!(g.tile_at(1, 2), 7);
+        assert_eq!(g.row_col(7), (1, 2));
+        assert!(Grid::new(0, 4).is_err());
+        assert!(Grid::new(4, 17).is_err());
+        assert!(
+            Grid::new(1, 1).is_err(),
+            "a 1-tile grid has no neighbours to refine against"
+        );
+    }
 }

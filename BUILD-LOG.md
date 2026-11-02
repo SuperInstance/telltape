@@ -134,6 +134,69 @@ not the image.
 Verification: `cargo test --workspace` — **67 passed, 0
 failed** (66 inherited + P6).
 
+## Slice 3 — G2 typed errors, G4 unit tests, configurable grid (2026-11-02, continuation)
+
+**G2.** Caller errors are typed refusals everywhere on the
+extracted core's public surface:
+
+- `harbor_watch::pipeline::PipelineError` (`EmptyRecords`,
+  `DimMismatch`, `TileOutOfGrid`, `ZeroDim`) — `run_records` and
+  `Pipeline::run` return it; the asserts/`expect` the plan named
+  (pipeline.rs) are gone.
+- `telltape::live::process_frame` returns
+  `Result<FrameOutput, PipelineError>` and validates the whole
+  frame *before* touching state.
+- `telltape::service::ServiceError` (`Ledger`, `Config`,
+  `EmbedderUnhealthy`, `Ingest`, `Pipeline`) replaces
+  `Result<Summary, String>` — the last string-typed surface.
+- Left as-is, deliberately: constructor invariants
+  (`Pipeline::new(dim>0)`) stay asserts, and `Ledger::
+  record_frame` keeps `std::io::Result` (already typed). The
+  distinction: *who can cause it* — a caller handing bad data
+  gets a refusal; a programmer breaking an invariant gets a
+  panic with the invariant named.
+
+**G4.** The desert modules now carry unit tests where they sit:
+`record.rs` (codec round-trip, named parse errors, line
+numbers, grid validation — 5), `pipeline.rs` (the three
+refusals + a custom-grid run — 4), `config.rs` (defaults,
+aliases, health-URL derivation, key-naming errors — 6),
+`ledger.rs` (percentiles, freshness transitions, frozen health,
+the P5 golden verdict row, grid-scaled budget baseline — 5).
+The P5 golden row lands here: a fixed frame's `events.jsonl`
+row is asserted field-by-field, so the published format is
+pinned by a test, not by prose.
+
+**Grid.** Runtime `harbor_watch::record::Grid` (rows × cols,
+each 1–16, ≥2 tiles, row-major) replaces the compile-time
+constant through the cascade, the live pipeline, the ledger
+(per-tile EMAs and the embed-everything baseline now scale with
+the grid; `lens.txt` writes `grid = RxC` so every ledger
+carries its own geometry), the service config
+(`grid_rows`/`grid_cols`, validated at load), and the ingest
+(`--grid RxC`; the staged object's placement is computed from
+the grid and still lands exactly on tiles {5,6} at 4×4). The
+default is 4×4 everywhere. `docs/GRID.md` ships the measured
+rationale — wave-3 and slice-1 numbers with sources, the
+α/λmax coupling, and what finer/coarser grids trade.
+
+**Deviation from plan §2.3, flagged:** the plan froze the grid
+as a v1 *format constant*; §10 ruling 4 (later, and Casey's)
+ordered configurability with the rationale documented. The
+ruling wins. The format concern behind the plan's freeze —
+strangers' indexes must stay interpretable — is answered
+mechanically instead: the grid is recorded in every ledger's
+`lens.txt`, and LEDGER-FORMAT.md states that a verdict row is
+read against it.
+
+Also fixed in passing: one inherited clippy MSRV warning in
+`rolling-substrate-core/src/spsc.rs` (`u64::is_multiple_of` →
+`%`, identical semantics) so the workspace is warning-free.
+
+Verification: `cargo test --workspace` **87 passed, 0 failed**
+(67 → 87: +20 unit tests), clippy `--workspace --all-targets`
+**0 warnings**, `cargo fmt --check` clean.
+
 ## Naming decision — telltape (2026-11-02)
 
 Casey delegated the name pick to Muse; decided the same day:

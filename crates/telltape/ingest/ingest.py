@@ -52,7 +52,13 @@ import numpy as np
 import requests
 from PIL import Image
 
-TILES = 16
+# The tile grid is configurable (config keys grid_rows/grid_cols on
+# the Rust side, --grid RxC here); 4x4 is the default — every
+# measured number in this repo's record was taken on it
+# (docs/GRID.md). The two halves must agree: tile count is the
+# contract between ingest and service.
+GRID_ROWS = 4
+GRID_COLS = 4
 
 
 def fixtures_dir():
@@ -83,11 +89,11 @@ def now_us():
     return int(time.time() * 1_000_000)
 
 
-def tiles_of(frame):
+def tiles_of(frame, rows=GRID_ROWS, cols=GRID_COLS):
     h, w = frame.shape[:2]
-    th, tw = h // 4, w // 4
+    th, tw = h // rows, w // cols
     return [frame[r * th:(r + 1) * th, c * tw:(c + 1) * tw]
-            for r in range(4) for c in range(4)]
+            for r in range(rows) for c in range(cols)]
 
 
 def frame_hash(frame):
@@ -209,9 +215,11 @@ class HashEmbedder(Embedder):
 # ---------------- emitter ----------------
 
 class Emitter:
-    def __init__(self, embedder, gate):
+    def __init__(self, embedder, gate, rows=GRID_ROWS, cols=GRID_COLS):
         self.embedder = embedder
         self.gate = gate
+        self.rows = rows
+        self.cols = cols
         self.prev_tiles = None
         self.prev_hash = None
 
@@ -226,7 +234,7 @@ class Emitter:
     def frame(self, img, frame_idx):
         """Tile, gate, embed nominated tiles, emit records + frame_end."""
         t_capture = now_us()
-        tls = tiles_of(img)
+        tls = tiles_of(img, self.rows, self.cols)
         nominated = []
         diffs = []
         for ti, t in enumerate(tls):
@@ -264,10 +272,12 @@ def _load_png(path):
     return np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
 
 
-def staged_frames():
+def staged_frames(rows=GRID_ROWS, cols=GRID_COLS):
     """(frames, truth). 18 frames: 0-3 scene A, 4 CUT to scene B,
-    7 object added (a real-photo patch over tiles 5,6), 10-17 gradual
-    drift (slow brightening: per-frame diff must stay under the gate).
+    7 object added (a real-photo patch over the two tiles right of
+    centre in the second row — tiles {5,6} on the default 4x4
+    grid), 10-17 gradual drift (slow brightening: per-frame diff
+    must stay under the gate).
 
     The scenes are composited from REAL photos — the bundled wave-3
     fixture frames (fixtures/wave3/A-00.png, B-00.png) and the
@@ -290,9 +300,14 @@ def staged_frames():
     def noisy(base):
         return np.clip(base + rng.normal(0, 1.0, base.shape), 0, 255)
 
+    th, tw = 512 // rows, 512 // cols
+    obj_tiles = [cols + 1, cols + 2]  # second row, tiles right of centre
+
     def with_object(base):
         out = base.copy()
-        out[128:256, 128:384] = patch                          # tiles 5,6
+        p = np.asarray(Image.fromarray(patch.astype(np.uint8)).resize(
+            (2 * tw, th)), dtype=np.float32)
+        out[th:2 * th, tw:3 * tw] = p
         return out
 
     frames = []
@@ -304,7 +319,7 @@ def staged_frames():
         frames.append(noisy(with_object(s2)))
     for k in range(8):  # drift: +1.2 brightness/frame
         frames.append(noisy(with_object(s2) + 1.2 * (k + 1)))
-    truth = {"cut_frame": 4, "object_frame": 7, "object_tiles": [5, 6],
+    truth = {"cut_frame": 4, "object_frame": 7, "object_tiles": obj_tiles,
              "drift_frames": list(range(10, 18)), "frames": len(frames)}
     return frames, truth
 
@@ -440,6 +455,9 @@ def main():
                          "startup against the adapter")
     ap.add_argument("--rack", default="http://127.0.0.1:8077",
                     help="for --embedder jev: the rack base URL")
+    ap.add_argument("--grid", default="4x4",
+                    help="tile grid ROWSxCOLS; must match the "
+                         "service config's grid_rows/grid_cols")
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--truth-out", default="")
     ap.add_argument("--fixtures-dir", default="",
@@ -459,9 +477,17 @@ def main():
     print(f"ingest: embedder {embedder.name} ok (dim {embedder.dim})",
           file=sys.stderr)
 
-    em = Emitter(embedder, args.gate)
+    try:
+        grows, gcols = (int(x) for x in args.grid.lower().split("x"))
+        if not (1 <= grows <= 16 and 1 <= gcols <= 16) or grows * gcols < 2:
+            raise ValueError
+    except ValueError:
+        print(f"ingest: bad --grid {args.grid!r} (want ROWSxCOLS, "
+              f"each 1..=16, at least 2 tiles)", file=sys.stderr)
+        return 2
+    em = Emitter(embedder, args.gate, grows, gcols)
     if args.source == "staged":
-        frames, truth = staged_frames()
+        frames, truth = staged_frames(grows, gcols)
         if args.truth_out:
             with open(args.truth_out, "w") as fh:
                 json.dump(truth, fh)
