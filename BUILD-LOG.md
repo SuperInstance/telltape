@@ -241,6 +241,45 @@ Python ingest and the test double: **8 frames, a 16/16 verdict
 at frame 5, a `source_frozen` receipt**. Workspace: **92
 passed, 0 failed**, clippy 0 warnings, fmt clean.
 
+## Slice 4 — the docs set (2026-11-02, continuation)
+
+- `README.md` — the front door: the seek-index idea in the
+  first screen, the staged-acceptance quickstart (test double,
+  labelled as proving pipeline+ledger, not perception), an
+  `index` quickstart, the verb table with `query`/`export`
+  honestly marked not-built, and a "what this is not" section
+  carrying the anti-bloat doctrine and the open trust loop.
+- `docs/LEDGER-FORMAT.md` — the four files field-by-field as
+  the code writes them *now* (including slice 2's freshness
+  fields and slice 3's `grid` line in lens.txt), the soak
+  placeholder quoted verbatim, the record-stream schema, and
+  `jq` recipes standing in for the unbuilt `query`.
+- `docs/EXAMPLES.md` — plan §8's five examples (staged
+  acceptance; wave-3 C; the soak **in progress**, frozen-feed
+  incident included, with a note that its defect is G1 and the
+  fix ships in this repo; the from-the-chair conversation,
+  Qwen3-Coder-30B-A3B named as the bench winner; the
+  morning-arrival reconstruction — choreography yes, scene
+  no), each with its exposed limit and origin source.
+- `docs/BRING-YOUR-OWN-EMBEDDER.md` — the seam contract
+  (request/response/width/latency/failure semantics), the
+  three shipped adapters, a stdlib service sketch, and the
+  I-JEPA note written without asserting terms we didn't read:
+  never bundled, the operator brings it under their own.
+  Two honest statements the doc makes because they are true:
+  the plan's in-process ONNX adapter is **not shipped** (the
+  HTTP shape is the route), and thresholds calibrated on
+  I-JEPA do not transfer to another embedder unmeasured.
+- `SECURITY.md` — the ledger as occupancy metadata; the sharp
+  edge named first (`ingest_cmd` is operator-trusted shell);
+  reporting route that does not pretend a public tracker
+  exists yet. `CONTRIBUTING.md` — subtraction doctrine,
+  numbers-carry-sources, format-is-contract, the battery.
+
+Docs describe the code as it stands after slices 2–3.5; the
+README's acceptance expectation (18 / 2 / 34) is re-verified
+against the shipped binary in the slice-5 stranger walk.
+
 ## Naming decision — telltape (2026-11-02)
 
 Casey delegated the name pick to Muse; decided the same day:
