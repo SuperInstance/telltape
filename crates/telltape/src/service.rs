@@ -280,12 +280,14 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
     let mut verdict_latencies: Vec<f64> = Vec::new();
     let mut summary = Summary::default();
 
+    let mut ended_by_eof = false;
     let mut line = String::new();
     loop {
         line.clear();
         let n = reader.read_line(&mut line).map_err(ServiceError::Ingest)?;
         if n == 0 {
-            break; // ingest EOF: clean end of stream
+            ended_by_eof = true;
+            break; // ingest EOF: end of stream (its exit status is checked below)
         }
         let line = line.trim();
         if line.is_empty() {
@@ -404,8 +406,27 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
     }
 
     if let Some(mut c) = child {
-        let _ = c.kill();
-        let _ = c.wait();
+        if ended_by_eof {
+            // The ingest ended the stream itself. Its exit status
+            // is part of the truth of this run: an ingest that died
+            // (bad flags, missing deps, a crashed embedder) must
+            // not read as a clean, empty watch — a zero-frame
+            // "success" is how broken installs hide. (When WE end
+            // the run — max_frames / stop file — the child is
+            // killed below and its status is meaningless.)
+            match c.wait() {
+                Ok(status) if !status.success() => {
+                    return Err(ServiceError::Ingest(std::io::Error::other(format!(
+                        "ingest command exited with {status} after {frames_received} frames"
+                    ))));
+                }
+                Ok(_) => {}
+                Err(e) => return Err(ServiceError::Ingest(e)),
+            }
+        } else {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 
     summary.frames = ledger.stats.frames_seen;

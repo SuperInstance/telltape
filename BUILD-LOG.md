@@ -280,6 +280,73 @@ Docs describe the code as it stands after slices 2–3.5; the
 README's acceptance expectation (18 / 2 / 34) is re-verified
 against the shipped binary in the slice-5 stranger walk.
 
+## Slice 5 — the proof battery, cold (2026-11-02, continuation)
+
+All in this repo, on this machine, against the shipped code:
+
+- `cargo test --workspace`: **93 passed, 0 failed** (66 at
+  extraction → 67 slice 2 → 87 slice 3 → 92 slice 3.5 → 93
+  with this slice's regression test).
+- `cargo clippy --workspace --all-targets`: **0 warnings.**
+  `cargo fmt --all --check`: clean.
+- `prove_fixtures.py` (P2, gate layer): **ALL PASS**.
+- **Staged acceptance through the binary** (P3, test double):
+  `telltape watch` on the bundled staged sequence — **18
+  frames, 2 events, 34 embeds**; frame 4 verdict = 16/16
+  tiles, frame 7 = exactly {5,6}; drift silent; spend ratio
+  **0.1181**; health `freshness = live`.
+- **Frozen-stream run** (P6 through the binary): 1 novel + 5
+  repeated frame_ends over stdin — 6 frames, 0 events, health
+  `freshness = frozen`, `silence_meaningful = false`, and a
+  `source_frozen` receipt in events.jsonl.
+- **`index` battery**: the 18 staged frames exported as a PNG
+  sequence and indexed — **18 / 2 / 34, identical verdicts**
+  (replay parity end-to-end). The same frames encoded as an
+  H.264 mp4 and indexed at 2 fps — again **18 / 2 / 34**,
+  spend 0.1181 (the gate's diffs survived the lossy round
+  trip unchanged on this material). Note: for indexed
+  footage, `verdict_latency_ms` measures processing lag
+  behind the footage's own timeline, not live latency — the
+  field's definition in LEDGER-FORMAT says capture → write,
+  and for a batch run those are far apart. Recorded here so
+  nobody quotes an index run's latency as a live number.
+- **Stranger walk** (P7): fresh `git clone` of this repo,
+  empty `$HOME`, README only. Two stumbles, both fixed in
+  this slice:
+  1. `pip install -r requirements.txt` is refused on
+     PEP 668 systems — README now builds a venv and says why.
+  2. **A real defect:** an ingest that died at startup (in
+     the walk, a missing Python dep) produced a *clean
+     zero-frame success* — EOF read as "stream over." The
+     service now checks the ingest's exit status when the
+     stream ends by EOF and fails the run typed
+     (`ServiceError::Ingest`) when it is nonzero; runs the
+     service itself ends (max_frames / stop file) still kill
+     the child without judging it. Regression test:
+     `dead_ingest_fails_the_run_but_empty_ingest_is_clean`.
+     Same honesty family as G1: an empty result must carry
+     its basis.
+  Re-walk after the fixes: venv deps install, acceptance
+  reproduces 18 / 2 / 34 with the exact verdicts, and an
+  index run over a synthesized recording (6 still frames,
+  cut, 6 more) yields 12 frames, **1 event (frame 6, 16
+  tiles), 32 embeds**, frozen→recovered receipts firing
+  mid-run, and `query` refusing by name with exit 2 as
+  documented. One walk caveat, honestly: the sandbox's
+  network proxy env was preserved during the re-walk (an
+  `env -i` first attempt failed PyPI over SSL — a harness
+  artifact, not a repo property); the Python deps are the
+  only network the walk needs.
+
+The battery the plan asked for (§5) is green at the layers
+that exist in this repo: P1 (tests), P2 (gate fixtures), P3
+(test-double verdicts), P5 (golden row, slice 3), P6
+(frozen), P7 (stranger walk). P4 — the staged acceptance
+against a *real* embedder over the generic HTTP adapter —
+remains the origin fleet's run to repeat; it is not claimed
+here, because this machine has no embedder service, and the
+plan's rule is that a layer proves only what it runs.
+
 ## Naming decision — telltape (2026-11-02)
 
 Casey delegated the name pick to Muse; decided the same day:

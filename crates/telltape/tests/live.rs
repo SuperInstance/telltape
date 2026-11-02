@@ -215,6 +215,36 @@ fn index_replays_an_image_sequence_through_the_same_pipeline() {
     assert!(events.contains("source_frozen"), "{events}");
 }
 
+/// Found by the slice-5 stranger walk: an ingest that dies at
+/// startup (there: a missing Python dep) used to read as a
+/// clean zero-frame success. A dead ingest must fail the run;
+/// a cleanly-exiting empty ingest stays a clean empty run.
+#[test]
+fn dead_ingest_fails_the_run_but_empty_ingest_is_clean() {
+    let dir = tempdir("ingest-status");
+    let base = Config {
+        stream_id: "s".into(),
+        ledger_dir: format!("{dir}/ledger"),
+        embed_url: String::new(),
+        ..Config::default()
+    };
+    let dead = Config {
+        ingest_cmd: "exit 3".into(),
+        ..base.clone()
+    };
+    match service::run(&dead) {
+        Err(e) => assert!(e.to_string().contains("exited with"), "{e}"),
+        Ok(s) => panic!("a dead ingest must not succeed: {s:?}"),
+    }
+    let empty = Config {
+        ingest_cmd: "true".into(),
+        ..base
+    };
+    let s = service::run(&empty).expect("a clean empty ingest is a clean run");
+    assert_eq!(s.frames, 0);
+    assert_eq!(s.events, 0);
+}
+
 /// A one-shot HTTP responder that answers 200 to everything: stands
 /// in for the rack's /health so the service loop can run in tests
 /// without a rack. (Embeds come from the records, not the rack —

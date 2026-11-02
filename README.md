@@ -52,8 +52,13 @@ and ffmpeg only if you index video files.
 
 ```sh
 cargo build --release
-pip install -r crates/telltape/requirements.txt
+python3 -m venv .venv && .venv/bin/pip install -r crates/telltape/requirements.txt
 ```
+
+(Keep the venv active — or call `.venv/bin/python3` wherever
+the configs below say `python3` — so the ingest finds its
+deps. A venv, not a system pip install: modern distributions
+refuse the latter, PEP 668.)
 
 **See it work — the staged acceptance** (real-photo fixtures
 bundled in the repo; a scene cut, an object appearing, then
