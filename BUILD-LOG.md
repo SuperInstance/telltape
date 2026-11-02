@@ -445,3 +445,109 @@ resume proceeds).
 **Version**: all three workspace crates 0.1.0 → 0.1.1; tagged
 v0.1.1 locally. Not pushed — publication stays the gated step,
 as before.
+
+## The query verb (2026-11-02, v0.2.0)
+
+`telltape query <ledger-dir>` built — the last decided verb
+from the v0.1.0 naming record except `export`, which stays
+refused by name. Query reads an existing ledger and prints
+plain text: a header (stream, the lens grid, the embedder
+identity), the tells (each verdict with local time and epoch,
+frame, stream, changed tiles with their row/col under the lens
+grid, embed calls), and the service events under the same
+filters. `--summary` adds counts by hour and by tile, total
+embed calls in filter, frozen stretches (`source_frozen` →
+`source_recovered`), service-stopped stretches (`stop` →
+`start`), embedder swaps, the full filtered service list, and
+the ledger's own state.txt totals labelled unfiltered.
+
+Decisions, and their reasons:
+
+- **Two clocks, named.** Verdicts filter and display on
+  capture time (`t_capture_us`); service rows only carry
+  `wall_us` and filter on that. The header states the basis on
+  every run — mixing the clocks silently is exactly the kind
+  of quiet wrongness this tool exists to avoid. `wall_us` is
+  still required for a verdict row to parse (its absence is a
+  malformed row), but query does not keep or use it.
+- **Read-only is structural.** Query only ever opens files
+  for reading and holds no `Ledger`. A test snapshots every
+  file's bytes (and the directory listing implicitly) around
+  default and summary runs and asserts byte-equality; a
+  writer round-trip test does the same around a real ledger.
+- **Malformed rows are counted, never skipped.** The count is
+  file-wide with 1-based line numbers (first ten), because
+  filters cannot apply to rows that do not parse — the output
+  says so rather than letting a filtered view imply the file
+  is clean. Blank lines are not rows.
+- **Filters say what they can and cannot match.** `--tile`
+  excludes service rows outright (they carry no tiles).
+  `--stream` matches a verdict's recorded stream; a service
+  row passes a stream filter only when the filter names the
+  ledger's own stream, since service rows predate the per-row
+  stream field's meaning for them — they belong to the
+  ledger's stream by construction.
+- **Legacy reads as unknown, never guessed.** No identity in
+  the lens prints `unknown embedder (pre-0.1.1 ledger: no
+  identity recorded)`; a recorded `unknown` prints `unknown
+  (recorded: no embedder was declared)`; an events-only
+  ledger (no lens.txt) reads with grid "not recorded" and raw
+  tile numbers — no geometry is invented. The grid always
+  comes from the lens; a lens grid that is not RxC, or outside
+  the record codec's limits, is a typed NotALedger error.
+- **Errors are typed and the exit codes follow the house
+  pattern.** `QueryError::{NotFound, NotALedger, Io}` exit 1;
+  `BadValue` (bad `--since`/`--until`/`--tile`) and other
+  usage errors exit 2; the refusal-by-name path for `export`
+  is unchanged (exit 2). A directory without events.jsonl is
+  NotALedger, not an empty answer.
+- **Local time without a dependency.** The workspace carries
+  no date/time crate, and query needed TZif parsing anyway to
+  be honest about offsets (a fixed-offset guess is wrong
+  across a DST boundary). `Zone` resolves `$TZ` (zoneinfo
+  name/path, then POSIX string) → `/etc/localtime` → UTC, and
+  never fails — worst case it renders UTC and labels it so.
+  TZif v1+v2 blocks, the pre-first-transition type chosen as
+  libc does (first standard-time type; verified against
+  America/Anchorage's 1970 AHST −10:00 as well as modern
+  AKST/AKDT). Time bounds accept epochs by magnitude
+  (s/ms/µs), bare decimals as seconds, and ISO 8601 with `Z`,
+  numeric offsets, or naive local readings; dates are
+  validated, so 2026-02-30 is a named refusal, not a rollover.
+  No new dependencies — the workspace's hand-rolled standard
+  holds.
+- **Stretches pair within the filter and say when they
+  can't.** An opener closed outside the filter reads "still
+  open at the last row in the filter"; a closer with no
+  opener in view is counted in a note. Nothing is paired
+  across the filter boundary silently.
+
+Doc gap, noted per the format doc's own rule: building query
+exposed no *format* ambiguity — every field it reads is
+written as LEDGER-FORMAT.md describes. One stale claim: the
+format doc's "Reading a ledger with shelf tools" section said
+query "is not built yet"; that sentence now names it as the
+reader and keeps the jq/grep recipes. No format content
+changed.
+
+**Tests**: 99 → 116 passed (+1 pre-existing ignore), all
+green; clippy `--all-targets -D warnings` clean; `cargo fmt`
+clean. New: 5 unit (civil-date anchors checked against
+`date(1)`, TZif transitions from the host's real zoneinfo,
+POSIX TZ strings, time-bound grammar, row parsing incl. the
+P5 golden row and five malformed shapes) and 12 integration
+(hand-written fixture ledgers — known-identity with a frozen
+stretch, a swap and a stop/start gap; legacy pre-0.1.1;
+events-only; malformed rows counted with line numbers; the
+read-only byte-snapshot proof; a writer round-trip through
+the real `Ledger`; typed errors; the binary's exit codes,
+its `TZ=America/Anchorage` rendering, and the `export`
+refusal). Staged acceptance untouched and re-run cold:
+18 frames, 34 embeds, 2 events, frame 4 = 16/16 tiles,
+frame 7 = exactly {5,6}, drift silent — and query run against
+that acceptance ledger as a final live check (identity read
+back as the recorded `unknown`, both tells listed).
+
+**Version**: all three workspace crates 0.1.1 → 0.2.0;
+tagged v0.2.0 locally. Not pushed — publication stays the
+gated step, as before.

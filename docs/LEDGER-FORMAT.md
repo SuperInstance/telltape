@@ -159,8 +159,10 @@ freshness stamps health.txt is computed from.
 
 ## Reading a ledger with shelf tools
 
-`query` is a decided verb that is not built yet; until it is,
-the format is plain enough to read directly:
+`query` is the ledger reader (`telltape query <ledger-dir>
+[--since T] [--until T] [--tile N] [--stream ID] [--summary]`,
+read-only). The format is also plain enough to read directly
+with shelf tools:
 
 ```sh
 jq -c 'select(.kind=="verdict") | {frame, changed_tiles}' ledger/events.jsonl

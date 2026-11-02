@@ -115,7 +115,7 @@ the ingest implements.
 |---|---|---|
 | `watch` | Live source → ledger | shipped |
 | `index` | Existing footage → ledger, through the identical pipeline | shipped |
-| `query` | Read a ledger (events by time/tile, spend summary) | decided, **not in this build** — the binary refuses it by name; the ledger is plain text and `jq`/`grep` recipes are in the format doc |
+| `query` | Read a ledger: `telltape query <ledger-dir> [--since T] [--until T] [--tile N] [--stream ID] [--summary]` — the tells and service events in local time, counts by hour and tile, embed spend, frozen stretches; read-only | shipped (v0.2.0) |
 | `export` | Ledger → CSV / ffmpeg chapters | designed in the extraction plan, **not built** |
 
 ## Documents

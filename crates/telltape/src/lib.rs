@@ -25,4 +25,5 @@ pub mod config;
 pub mod index;
 pub mod ledger;
 pub mod live;
+pub mod query;
 pub mod service;

@@ -1,6 +1,6 @@
 [package]
 name = "telltape"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 description = "telltape: watch a video stream and write a structured text ledger of what changed, where, and when — the ledger is a seek index into footage you keep elsewhere. Frames are tiled and diff-gated by the ingest; nominated tiles are embedded through a pluggable embedder seam; the change cascade (perceive -> decide -> direct -> refine -> publish, on rolling-substrate-core rings) runs incrementally, frame by frame."
