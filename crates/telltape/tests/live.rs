@@ -11,10 +11,10 @@
 //!    cut published as an event, rack lifecycle untouched (we did
 //!    not start it, so we must not stop it).
 
-use tellstream::config::Config;
-use tellstream::ledger::Ledger;
-use tellstream::live::LivePipeline;
-use tellstream::service;
+use telltape::config::Config;
+use telltape::ledger::Ledger;
+use telltape::live::LivePipeline;
+use telltape::service;
 use harbor_watch::fixture;
 use harbor_watch::pipeline::{run_records, Config as PipeConfig};
 use harbor_watch::record::record_to_json;
@@ -23,7 +23,7 @@ use std::io::Write;
 
 fn tempdir(tag: &str) -> String {
     let d = std::env::temp_dir().join(format!(
-        "tellstream-test-{tag}-{}",
+        "telltape-test-{tag}-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&d);
@@ -89,7 +89,7 @@ fn ledger_files_and_lineage() {
     for r in &fx.records {
         by_frame.entry(r.frame).or_default().push(r.clone());
     }
-    let now = tellstream::ledger::epoch_us();
+    let now = telltape::ledger::epoch_us();
     for (frame, recs) in by_frame {
         let n = recs.len() as u64;
         let out = live.process_frame(frame, recs);
@@ -147,7 +147,7 @@ fn service_end_to_end_via_ingest_interface() {
     let fx = fixture::generate(128, 7);
     let dir = tempdir("service");
     let recs_path = format!("{dir}/records.jsonl");
-    let now = tellstream::ledger::epoch_us();
+    let now = telltape::ledger::epoch_us();
     {
         let mut f = std::fs::File::create(&recs_path).unwrap();
         let mut by_frame: BTreeMap<u32, Vec<_>> = BTreeMap::new();

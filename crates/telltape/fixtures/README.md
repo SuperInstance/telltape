@@ -35,7 +35,7 @@ of each are the cold set, not a replacement archive.
 ## How paths resolve (ingest.py `fixtures_dir()`)
 
 1. `--fixtures-dir DIR` on the ingest command line,
-2. `$TELLSTREAM_FIXTURES_DIR`,
+2. `$TELLTAPE_FIXTURES_DIR`,
 3. this directory (resolved relative to the ingest script).
 
 Full-library overrides, also explicit-only:

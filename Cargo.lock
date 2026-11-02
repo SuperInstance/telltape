@@ -14,7 +14,7 @@ name = "rolling-substrate-core"
 version = "0.1.0"
 
 [[package]]
-name = "tellstream"
+name = "telltape"
 version = "0.1.0"
 dependencies = [
  "harbor-watch",

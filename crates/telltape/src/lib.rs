@@ -1,4 +1,4 @@
-//! tellstream (working title): the live change-ledger engine.
+//! telltape: the live change-ledger engine.
 //!
 //! Architecture:
 //!

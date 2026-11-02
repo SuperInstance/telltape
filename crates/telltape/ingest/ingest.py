@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tellstream ingest: frames -> tiles -> diff gate -> embeddings.
+"""telltape ingest: frames -> tiles -> diff gate -> embeddings.
 
 Owns everything the Rust service should not: frame acquisition, image
 decode, tiling, the cheap frame-diff gate, and the embedder calls.
@@ -59,20 +59,20 @@ def fixtures_dir():
     """Where the bundled cold fixtures live, in resolution order:
 
     1. `--fixtures-dir DIR` (explicit config, set in main()),
-    2. `$TELLSTREAM_FIXTURES_DIR`,
-    3. the fixtures bundled in this repo at `crates/tellstream/fixtures/`
+    2. `$TELLTAPE_FIXTURES_DIR`,
+    3. the fixtures bundled in this repo at `crates/telltape/fixtures/`
        (resolved relative to this file, never the CWD or $HOME).
 
     A stranger running from a fresh clone always lands on (3): no
     path in anyone's home directory is a default anywhere in this
     file. A full local frame library (e.g. a larger wave-3 set) is
-    reachable only through the explicit TELLSTREAM_WAVE3_A_GLOB /
-    TELLSTREAM_WAVE3_B_GLOB / TELLSTREAM_WAVE3_B_FILE overrides in
+    reachable only through the explicit TELLTAPE_WAVE3_A_GLOB /
+    TELLTAPE_WAVE3_B_GLOB / TELLTAPE_WAVE3_B_FILE overrides in
     wave3_frames().
     """
     if getattr(fixtures_dir, "override", None):
         return fixtures_dir.override
-    env = os.environ.get("TELLSTREAM_FIXTURES_DIR")
+    env = os.environ.get("TELLTAPE_FIXTURES_DIR")
     if env:
         return env
     return os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -318,7 +318,7 @@ def _fixture_frames(name):
         raise FileNotFoundError(
             f"no bundled wave-3 fixtures matching {name}-*.png under "
             f"{fixtures_dir()} — pass --fixtures-dir or set "
-            f"TELLSTREAM_FIXTURES_DIR (see fixtures/README.md)")
+            f"TELLTAPE_FIXTURES_DIR (see fixtures/README.md)")
     return [_load_png(p) for p in paths]
 
 
@@ -328,13 +328,13 @@ def wave3_frames(seq):
     Default material is the bundled fixture set (6 A + 6 B — enough
     for the full C sequence, which interleaves the first 6 of each).
     A larger local library is used ONLY when explicitly configured:
-    TELLSTREAM_WAVE3_A_GLOB / TELLSTREAM_WAVE3_B_GLOB (globs of
-    image files) or TELLSTREAM_WAVE3_B_FILE (one multi-frame image,
+    TELLTAPE_WAVE3_A_GLOB / TELLTAPE_WAVE3_B_GLOB (globs of
+    image files) or TELLTAPE_WAVE3_B_FILE (one multi-frame image,
     e.g. the original animated webp — frames are centre-cropped to
     square and resized to 512x512, as the original rig did)."""
-    a_glob = os.environ.get("TELLSTREAM_WAVE3_A_GLOB")
-    b_glob = os.environ.get("TELLSTREAM_WAVE3_B_GLOB")
-    b_file = os.environ.get("TELLSTREAM_WAVE3_B_FILE")
+    a_glob = os.environ.get("TELLTAPE_WAVE3_A_GLOB")
+    b_glob = os.environ.get("TELLTAPE_WAVE3_B_GLOB")
+    b_file = os.environ.get("TELLTAPE_WAVE3_B_FILE")
     if a_glob:
         A = [_load_png(p) for p in sorted(glob.glob(a_glob))]
     else:
@@ -444,7 +444,7 @@ def main():
     ap.add_argument("--truth-out", default="")
     ap.add_argument("--fixtures-dir", default="",
                     help="fixture directory override (else "
-                         "$TELLSTREAM_FIXTURES_DIR, else the fixtures "
+                         "$TELLTAPE_FIXTURES_DIR, else the fixtures "
                          "bundled in this repo)")
     args = ap.parse_args()
     if args.fixtures_dir:

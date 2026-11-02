@@ -128,7 +128,7 @@ pub fn run(cfg: &Config) -> Result<Summary, String> {
     if !up {
         let url = health_url.as_deref().unwrap_or("");
         if cfg.embedder_autostart && !cfg.embedder_start_cmd.is_empty() {
-            eprintln!("[tellstream] embedder down at startup; running embedder_start_cmd");
+            eprintln!("[telltape] embedder down at startup; running embedder_start_cmd");
             ledger
                 .service_event(
                     "embedder_start",
@@ -258,7 +258,7 @@ pub fn run(cfg: &Config) -> Result<Summary, String> {
                     break;
                 }
                 if !cfg.stop_file.is_empty() && std::path::Path::new(&cfg.stop_file).exists() {
-                    eprintln!("[tellstream] stop file seen; shutting down");
+                    eprintln!("[telltape] stop file seen; shutting down");
                     break;
                 }
             }
@@ -272,7 +272,7 @@ pub fn run(cfg: &Config) -> Result<Summary, String> {
                 pending.push(rec);
             }
             Err(e) => {
-                eprintln!("[tellstream] skipping malformed line: {e}");
+                eprintln!("[telltape] skipping malformed line: {e}");
             }
         }
     }
@@ -294,7 +294,7 @@ pub fn run(cfg: &Config) -> Result<Summary, String> {
 
     // ---- embedder lifecycle: restore as found
     if embedder_started_by_me && cfg.stop_embedder_on_exit && !cfg.embedder_stop_cmd.is_empty() {
-        eprintln!("[tellstream] stopping embedder (this service started it)");
+        eprintln!("[telltape] stopping embedder (this service started it)");
         ledger
             .service_event(
                 "embedder_stop",

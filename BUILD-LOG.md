@@ -6,10 +6,10 @@ Source of truth for scope: `docs/EXTRACTION-PLAN.md` in the origin
 repo (SI-Thor/rolling-perception, private), §1/§2 (the IN list and
 the dependency surgery) and §10 (Casey's five rulings, 2026-11-02):
 
-1. The standalone tool gets a standalone name. Working title here:
-   **`tellstream`** — a placeholder Casey has not approved; the code
-   is structured so a rename is one search-replace of `tellstream`
-   (plus the crate directory name).
+1. The standalone tool gets a standalone name: **`telltape`**
+   (decided 2026-11-02 — see the naming entry at the end of this
+   log; the build ran as `tellstream` through slice 1 and was
+   renamed in one search-replace, exactly as structured).
 2. NEW repo, clean history. This repo's first commit is the
    extraction; nothing inherits the origin history.
 3. Restrictive-licence parts are never incorporated: the seam
@@ -31,7 +31,7 @@ staging tree is read-only source; the two ruled-out options
   `crates/rolling-substrate-core` (whole crate — rings, sheaf,
   SPSC, lineage, gating), `crates/harbor-watch` (record, pipeline,
   rng, fixture, ablation, its integration tests and 1280-dim
-  fixture files), `slice1/core` → `crates/tellstream` (src, tests,
+  fixture files), `slice1/core` → `crates/telltape` (src, tests,
   ingest, fixtures 3.3 MB, prove_fixtures.py, test-server.py).
   `harbor-watch/src/main.rs` (the wave-3 file driver bin) was NOT
   carried: the IN list names the library modules; the driver was a
@@ -39,9 +39,9 @@ staging tree is read-only source; the two ruled-out options
   reusable surface.
 - Licences copied from the origin root: LICENSE, LICENSE-MIT,
   LICENSE-APACHE.
-- Renames: `confluence-watch` → `tellstream` (package, binary,
-  library crate `confluence_watch` → `tellstream`), test tempdirs,
-  env overrides `CONFLUENCE_*` → `TELLSTREAM_*` (fresh tool, no
+- Renames: `confluence-watch` → `telltape` (package, binary,
+  library crate `confluence_watch` → `telltape`), test tempdirs,
+  env overrides `CONFLUENCE_*` → `TELLTAPE_*` (fresh tool, no
   legacy readers; the old names are not aliased in code — the
   config-file keys for the embedder ARE aliased for one release,
   per plan §2.2, because config files are technician-edited text
@@ -70,7 +70,7 @@ staging tree is read-only source; the two ruled-out options
   by a startup probe embed. `prove_fixtures.py` now stubs the
   same seam with a recorder adapter instead of monkey-patching
   `Emitter.embed`. Ingest Python deps declared in
-  `crates/tellstream/requirements.txt` (numpy, requests, Pillow).
+  `crates/telltape/requirements.txt` (numpy, requests, Pillow).
 - One origin defect fixed in passing: `prove_fixtures.py`
   asserted fixture paths must not contain `/home/` — a condition
   no checkout under a home directory can satisfy, including the
@@ -83,7 +83,7 @@ staging tree is read-only source; the two ruled-out options
 
 Slice-1 verification (this machine, debug build):
 - `cargo test --workspace`: **66 passed, 0 failed** (substrate
-  55 incl. property suites, harbor-watch 8, tellstream 3
+  55 incl. property suites, harbor-watch 8, telltape 3
   integration — parity / ledger / service-interface all green
   through the surgery).
 - `prove_fixtures.py`: ALL PASS (gate layer: baseline 16, cut
@@ -93,3 +93,34 @@ Slice-1 verification (this machine, debug build):
   frames → **34 embeds**, verdict frame 4 = 16/16 tiles, frame 7
   = exactly {5,6}, drift silent, lineage 31, spend ratio
   **0.1181** — the plan §5 P3 numbers, reproduced cold.
+
+## Naming decision — telltape (2026-11-02)
+
+Casey delegated the name pick to Muse; decided the same day:
+**telltape**. Recorded here with its reasons, per the process
+doctrine:
+
+- **Cold-inference test** (Casey's criterion: an agent reader
+  meeting the name cold should be able to infer what the tool
+  does): *tell* = it reports what changed; *tape* = the footage
+  it watches, live or recorded. Both halves describe the actual
+  function — a change-ledger over video the user keeps.
+- Rejected: *telltale* — fails descriptiveness (it names a
+  symptom, not a function) and is already taken by an analytics
+  product and a game studio. *watchlog* was not memorable.
+- A web scan found **no existing telltape software product**.
+- Vocabulary, binding on all docs from here on: each ledger
+  entry is a **tell** ("the ledger holds 14 tells for that
+  night"). CLI verbs: **telltape watch** (live source →
+  ledger), **telltape index** (existing footage → ledger),
+  **telltape query** (read a ledger). This build ships `watch`
+  only; the binary refuses `index`/`query` by name rather than
+  pretending, until the toolkit slices build them.
+- Mechanics of the rename: built as `tellstream` through
+  slice 1 per the task brief; renamed in one commit — crate
+  directory (`git mv`), package/binary/library names, env
+  overrides (`TELLSTREAM_*` → `TELLTAPE_*`), doc and config
+  references. Zero `tellstream` references remain (grep-verified,
+  excluding build artifacts), and the test suite + staged
+  acceptance were re-run green under the new name before this
+  entry was written (numbers in the verification commit).
