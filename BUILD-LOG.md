@@ -197,6 +197,50 @@ Verification: `cargo test --workspace` **87 passed, 0 failed**
 (67 → 87: +20 unit tests), clippy `--workspace --all-targets`
 **0 warnings**, `cargo fmt --check` clean.
 
+## Slice 3.5 — `index`: existing footage → ledger (2026-11-02, continuation)
+
+Plan §3.1 lists `index` in the toolkit surface as
+*extract + new-thin*: the replay path already existed (live ≡
+batch parity, the staged/wave3 sources are replays); the new
+part is a file frame source. Built, because the plan requires
+it — `query`/`export` remain refused-by-name (the plan lists
+them, this build's mandate named `index`; they are recorded
+here as the known remainder, not silently dropped).
+
+- Ingest `--source file` (`ingest.py::file_frames`): a video
+  file (decoded by ffmpeg at `--fps` into a temp dir; footage
+  untouched), an image sequence (directory or glob), or a
+  single image. Frames go through the *identical* `Emitter`
+  path as live sources — same tiling, gate, records, freshness
+  stamps. Capture times are the footage's own: frame k at
+  start + k/fps, start = `--start-us` when given, else file
+  mtime − probed duration, else mtime — the approximation is
+  documented in the ingest header, not hidden.
+- `Emitter.frame` takes an optional capture timestamp; live
+  sources still stamp arrival time. File replay does not pace
+  itself by cadence — indexing is batch work.
+- Rust: `telltape::index::index_file` composes the ingest
+  command from the watch config itself (embedder statement:
+  `embed_url` set → generic HTTP adapter with
+  `embed_field`/`embed_key`/`embed_dim`; unset → the test
+  double; `ingest_script` from config or `$TELLTAPE_INGEST`,
+  never a guessed home path) and runs the *identical* service
+  loop. New config keys: `embed_dim`, `embed_field`,
+  `embed_key`, `gate_diff`, `ingest_script`, `index_fps`,
+  `index_start_us`. CLI: `telltape index <footage> --config
+  <file> [--fps N]`.
+- Because the loop is shared, freshness accounting applies to
+  footage too: a static stretch of a recording accrues repeats
+  and receipts `source_frozen` — the ledger describes the
+  footage, and a frozen stretch is frozen, whoever recorded it.
+
+Verification: unit tests for the composed command (4) + an
+integration test — 5 identical stills then a held hard cut,
+indexed from an image-sequence directory through the real
+Python ingest and the test double: **8 frames, a 16/16 verdict
+at frame 5, a `source_frozen` receipt**. Workspace: **92
+passed, 0 failed**, clippy 0 warnings, fmt clean.
+
 ## Naming decision — telltape (2026-11-02)
 
 Casey delegated the name pick to Muse; decided the same day:

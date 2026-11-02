@@ -22,6 +22,17 @@ Sources (identical interface — the service cannot tell them apart):
   shot     IP Webcam style: poll GET <url> for one JPEG per frame.
   mjpeg    IP Webcam style: MJPEG stream at <url> (/video), frames
            taken at the lens cadence, drop-to-newest.
+  file     Existing footage (the `telltape index` verb): a video
+           file decoded with ffmpeg at --fps, an image sequence
+           (a directory or glob of stills), or a single image.
+           Frames are replayed through the identical Emitter path
+           as live sources — same tiling, same gate, same records —
+           so an index ledger means exactly what a watch ledger
+           means. Capture times: frame k sits at start + k/fps;
+           the start epoch is --start-us when given, else the
+           file's mtime minus its probed duration (an export's
+           mtime is when the recording ended — an approximation,
+           documented as such), else the mtime itself.
 
 Embedders (one seam, three adapters — see
 docs/BRING-YOUR-OWN-EMBEDDER.md):
@@ -47,7 +58,7 @@ frame_end carries the hash and whether this frame is byte-identical
 to the previous one, so the service can tell a frozen source from a
 quiet scene (the soak incident — see docs/EXAMPLES.md E3).
 """
-import argparse, glob, hashlib, io, json, os, sys, time
+import argparse, glob, hashlib, io, json, os, subprocess, sys, tempfile, time
 import numpy as np
 import requests
 from PIL import Image
@@ -231,9 +242,9 @@ class Emitter:
                 f"!= configured {self.embedder.dim}")
         return vec, ms
 
-    def frame(self, img, frame_idx):
+    def frame(self, img, frame_idx, t_capture_us=None):
         """Tile, gate, embed nominated tiles, emit records + frame_end."""
-        t_capture = now_us()
+        t_capture = t_capture_us if t_capture_us is not None else now_us()
         tls = tiles_of(img, self.rows, self.cols)
         nominated = []
         diffs = []
@@ -415,6 +426,70 @@ def mjpeg_frames(url, cadence_ms):
                 yield np.asarray(img, dtype=np.float32)
 
 
+# ---------------- file source (telltape index) ----------------
+
+IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+
+
+def _probe_duration_s(path):
+    """Container duration via ffprobe, or None when unavailable."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30)
+        return float(out.stdout.strip())
+    except Exception:
+        return None
+
+
+def file_frames(path, fps, start_us):
+    """Yield (frame, t_capture_us) for existing footage.
+
+    A directory or glob is an image sequence (frames at --fps);
+    an image file is a one-frame sequence; anything else is a
+    video, decoded by ffmpeg at --fps into a temp dir (the
+    footage itself is never modified; the temp frames are the
+    decoder's working set, removed with the process's temp dir).
+    """
+    if os.path.isdir(path):
+        files = sorted(f for f in glob.glob(os.path.join(path, "*"))
+                       if f.lower().endswith(IMG_EXTS))
+    elif any(ch in path for ch in "*?["):
+        files = sorted(f for f in glob.glob(path)
+                       if f.lower().endswith(IMG_EXTS))
+    elif path.lower().endswith(IMG_EXTS):
+        files = [path]
+    else:
+        files = None
+    if files is not None:
+        if not files:
+            raise FileNotFoundError(f"no image frames under {path!r}")
+        base = start_us or int(os.path.getmtime(files[0]) * 1_000_000)
+        step = int(1_000_000 / fps)
+        for k, f in enumerate(files):
+            yield _load_png(f), base + k * step
+        return
+    # video file: anchor the epoch at (mtime - duration) when the
+    # container can be probed — the recording's own start, as
+    # closely as an export's metadata allows.
+    dur = _probe_duration_s(path)
+    if start_us:
+        base = start_us
+    elif dur:
+        base = int((os.path.getmtime(path) - dur) * 1_000_000)
+    else:
+        base = int(os.path.getmtime(path) * 1_000_000)
+    tmp = tempfile.mkdtemp(prefix="telltape-index-")
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", path, "-vf", f"fps={fps}",
+         "-start_number", "0", os.path.join(tmp, "f-%06d.png")],
+        check=True)
+    step = int(1_000_000 / fps)
+    for k, f in enumerate(sorted(glob.glob(os.path.join(tmp, "f-*.png")))):
+        yield _load_png(f), base + k * step
+
+
 # ---------------- embedder construction ----------------
 
 def build_embedder(args):
@@ -433,7 +508,18 @@ def build_embedder(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True,
-                    choices=["staged", "wave3", "shot", "mjpeg"])
+                    choices=["staged", "wave3", "shot", "mjpeg", "file"])
+    ap.add_argument("--file", default="",
+                    help="for --source file: a video file, an image "
+                         "file, a directory of images, or an image glob")
+    ap.add_argument("--fps", type=float, default=2.0,
+                    help="for --source file: frames per second to "
+                         "take from the footage (and the rate assumed "
+                         "for image sequences)")
+    ap.add_argument("--start-us", type=int, default=0,
+                    help="for --source file: capture epoch (us) of "
+                         "frame 0; 0 = derive from the file (mtime "
+                         "minus probed duration)")
     ap.add_argument("--url", default="")
     ap.add_argument("--seq", default="C", choices=["A", "B", "C"])
     ap.add_argument("--gate", type=float, default=3.0)
@@ -486,6 +572,7 @@ def main():
               f"each 1..=16, at least 2 tiles)", file=sys.stderr)
         return 2
     em = Emitter(embedder, args.gate, grows, gcols)
+    timed = args.source == "file"
     if args.source == "staged":
         frames, truth = staged_frames(grows, gcols)
         if args.truth_out:
@@ -496,22 +583,34 @@ def main():
         gen = iter(wave3_frames(args.seq))
     elif args.source == "shot":
         gen = shot_frames(args.url)
+    elif args.source == "file":
+        if not args.file:
+            print("ingest: --source file needs --file", file=sys.stderr)
+            return 2
+        if args.fps <= 0:
+            print("ingest: --fps must be > 0", file=sys.stderr)
+            return 2
+        gen = file_frames(args.file, args.fps, args.start_us)
     else:
         gen = mjpeg_frames(args.url, args.cadence_ms)
 
     idx = 0
-    for img in gen:
+    for item in gen:
         t0 = time.time()
+        img, t_capture = item if timed else (item, None)
         if img.shape[0] != 512 or img.shape[1] != 512:
             img = np.asarray(Image.fromarray(img.astype(np.uint8)).resize((512, 512)),
                              dtype=np.float32)
-        em.frame(img, idx)
+        em.frame(img, idx, t_capture)
         idx += 1
         if args.max_frames and idx >= args.max_frames:
             break
-        wait = args.cadence_ms / 1000.0 - (time.time() - t0)
-        if wait > 0:
-            time.sleep(wait)
+        if not timed:
+            # Live sources pace themselves by cadence; file replay
+            # is batch work and runs as fast as it can be read.
+            wait = args.cadence_ms / 1000.0 - (time.time() - t0)
+            if wait > 0:
+                time.sleep(wait)
     return 0
 
 

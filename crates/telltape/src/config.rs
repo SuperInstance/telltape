@@ -62,6 +62,32 @@ pub struct Config {
     pub max_frames: u32,
     /// Checked once per frame; if it appears, shut down cleanly.
     pub stop_file: String,
+    /// Expected embedding width of the configured embedder
+    /// (default 1280, the I-JEPA width). Used by `index` when it
+    /// composes its ingest command.
+    pub embed_dim: usize,
+    /// Multipart field name for the generic HTTP embedder
+    /// (default "file"). Used by `index`'s composed command.
+    pub embed_field: String,
+    /// JSON response key for the generic HTTP embedder (default
+    /// "embedding"). Used by `index`'s composed command.
+    pub embed_key: String,
+    /// The ingest diff gate (mean-abs pixel diff above which a
+    /// tile is nominated). `watch` configs carry this inside
+    /// their hand-written `ingest_cmd`; `index` composes its
+    /// command from this key. Default 3.0, the calibrated value
+    /// of the origin record.
+    pub gate_diff: f64,
+    /// Path to `ingest/ingest.py`, used by `index` to compose its
+    /// command. Empty = `$TELLTAPE_INGEST`, else an error naming
+    /// the key (no home-directory path is ever a default).
+    pub ingest_script: String,
+    /// Frames per second `index` takes from a video file (and
+    /// the rate assumed for image sequences). Default 2.0.
+    pub index_fps: f64,
+    /// Capture epoch (µs) of frame 0 for `index`; 0 = derive
+    /// from the footage file (mtime minus probed duration).
+    pub index_start_us: u64,
 }
 
 impl Default for Config {
@@ -84,6 +110,13 @@ impl Default for Config {
             soak: false,
             max_frames: 0,
             stop_file: String::new(),
+            embed_dim: 1280,
+            embed_field: "file".into(),
+            embed_key: "embedding".into(),
+            gate_diff: 3.0,
+            ingest_script: String::new(),
+            index_fps: 2.0,
+            index_start_us: 0,
         }
     }
 }
@@ -170,6 +203,15 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
     if let Some(v) = get1("stop_file") {
         cfg.stop_file = v;
     }
+    if let Some(v) = get1("embed_field") {
+        cfg.embed_field = v;
+    }
+    if let Some(v) = get1("embed_key") {
+        cfg.embed_key = v;
+    }
+    if let Some(v) = get1("ingest_script") {
+        cfg.ingest_script = v;
+    }
     let num = |k: &str| -> Result<Option<f64>, ConfigError> {
         match get1(k) {
             Some(s) => s
@@ -217,6 +259,18 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
 
     if let Some(v) = num("max_frames")? {
         cfg.max_frames = v as u32;
+    }
+    if let Some(v) = num("embed_dim")? {
+        cfg.embed_dim = v as usize;
+    }
+    if let Some(v) = num("gate_diff")? {
+        cfg.gate_diff = v;
+    }
+    if let Some(v) = num("index_fps")? {
+        cfg.index_fps = v;
+    }
+    if let Some(v) = num("index_start_us")? {
+        cfg.index_start_us = v as u64;
     }
     Ok(cfg)
 }

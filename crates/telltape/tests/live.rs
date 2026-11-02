@@ -183,6 +183,38 @@ fn frozen_source_reads_frozen_not_meaningful_silence() {
     assert!(events.contains("source_frozen"), "{events}");
 }
 
+/// Slice 3.5 — `index` over an image sequence: five identical
+/// stills (a frozen stretch of footage), then a hard cut held for
+/// three frames. Replayed through the file source and the
+/// identical service loop, the ledger must show all 8 frames, a
+/// 16/16 verdict on the cut frame (frame 5), and a source_frozen
+/// receipt for the identical stretch — freshness accounting does
+/// not exempt recorded footage.
+#[test]
+fn index_replays_an_image_sequence_through_the_same_pipeline() {
+    let dir = tempdir("index");
+    let seq = format!("{dir}/seq");
+    std::fs::create_dir_all(&seq).unwrap();
+    let fxdir = format!("{}/fixtures/wave3", env!("CARGO_MANIFEST_DIR"));
+    for k in 0..8 {
+        let src = if k < 5 { "A-00.png" } else { "B-00.png" };
+        std::fs::copy(format!("{fxdir}/{src}"), format!("{seq}/f-{k:03}.png")).unwrap();
+    }
+    let cfg = Config {
+        stream_id: "index-test".into(),
+        ledger_dir: format!("{dir}/ledger"),
+        ingest_script: format!("{}/ingest/ingest.py", env!("CARGO_MANIFEST_DIR")),
+        ..Config::default()
+    };
+    let summary = telltape::index::index_file(&cfg, &seq).expect("index run");
+    assert_eq!(summary.frames, 8);
+    assert!(summary.events >= 1, "the cut must publish: {summary:?}");
+    let events = std::fs::read_to_string(format!("{dir}/ledger/events.jsonl")).unwrap();
+    assert!(events.contains("\"frame\":5"), "{events}");
+    assert!(events.contains("\"changed_tiles\":[0, 1, 2"), "{events}");
+    assert!(events.contains("source_frozen"), "{events}");
+}
+
 /// A one-shot HTTP responder that answers 200 to everything: stands
 /// in for the rack's /health so the service loop can run in tests
 /// without a rack. (Embeds come from the records, not the rack —
