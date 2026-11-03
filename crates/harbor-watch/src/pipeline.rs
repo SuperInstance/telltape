@@ -92,6 +92,20 @@ pub enum PipelineError {
     TileOutOfGrid { tile: u32, tiles: usize },
     /// The pipeline was built with a zero embedding dimension.
     ZeroDim,
+    /// A record's embedding is degenerate — zero norm, or a
+    /// non-finite component or norm (playtest F1). Such a vector
+    /// carries no information, yet under the old scorer it
+    /// produced maximal distance scores: a broken embedder
+    /// returning zeros yielded a confident, perfect-looking
+    /// ledger of pixel-diff echoes. A degenerate embedding is
+    /// refused, typed, before any frame is scored — the run
+    /// stops rather than guess.
+    DegenerateEmbedding {
+        seq: u64,
+        frame: u32,
+        tile: u32,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for PipelineError {
@@ -108,6 +122,16 @@ impl fmt::Display for PipelineError {
                 write!(f, "tile {tile} out of grid ({tiles} tiles)")
             }
             PipelineError::ZeroDim => write!(f, "pipeline dimension must be > 0"),
+            PipelineError::DegenerateEmbedding {
+                seq,
+                frame,
+                tile,
+                reason,
+            } => write!(
+                f,
+                "record seq {seq} has a degenerate embedding ({reason}) at frame {frame} tile {tile}: \
+                 the vector carries no information and must not be scored"
+            ),
         }
     }
 }
@@ -244,6 +268,14 @@ impl Pipeline {
                     tiles,
                 });
             }
+            if let Some(reason) = crate::rng::degenerate_reason(&r.embedding) {
+                return Err(PipelineError::DegenerateEmbedding {
+                    seq: r.seq,
+                    frame: r.frame,
+                    tile: r.tile,
+                    reason,
+                });
+            }
             by_frame.entry(r.frame).or_default().push(r);
         }
 
@@ -283,7 +315,7 @@ impl Pipeline {
                 debug_assert_eq!(emb, r.embedding);
                 let score = prev_emb[t]
                     .as_ref()
-                    .map(|p| crate::rng::cosine_distance(p, &emb));
+                    .and_then(|p| crate::rng::cosine_distance(p, &emb));
                 {
                     let mut lease = self.decide.lease();
                     lease.data_mut()[0] = score.unwrap_or(0.0) as f32;
@@ -450,7 +482,10 @@ mod tests {
 
     #[test]
     fn dim_mismatch_is_refused_not_panicked() {
-        let recs = vec![rec(0, 0, vec![0.0; 8]), rec(0, 1, vec![0.0; 4])];
+        // (The sound record's vector is non-zero: since F1 an
+        // all-zeros record is refused as degenerate in its own
+        // right, before the second record's width is examined.)
+        let recs = vec![rec(0, 0, vec![0.5; 8]), rec(0, 1, vec![0.0; 4])];
         match run_records(&recs, Config::default()) {
             Err(PipelineError::DimMismatch {
                 expected: 8,
@@ -458,6 +493,24 @@ mod tests {
                 ..
             }) => {}
             other => panic!("expected DimMismatch, got {other:?}"),
+        }
+    }
+
+    /// Playtest F1: a zero vector (a dead embedder's placeholder
+    /// output) must be refused before scoring — under the old
+    /// scorer it would have scored maximal distance and published
+    /// a confident, wrong verdict. NaN is refused the same way.
+    #[test]
+    fn degenerate_embeddings_are_refused_not_scored() {
+        let sound = vec![1.0f32, 0.0, 0.0, 0.0];
+        for bad in [vec![0.0; 4], vec![f32::NAN, 0.0, 0.0, 0.0]] {
+            let recs = vec![rec(0, 0, sound.clone()), rec(1, 0, bad)];
+            match run_records(&recs, Config::default()) {
+                Err(PipelineError::DegenerateEmbedding {
+                    frame: 1, tile: 0, ..
+                }) => {}
+                other => panic!("expected DegenerateEmbedding, got {other:?}"),
+            }
         }
     }
 

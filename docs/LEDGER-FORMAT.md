@@ -21,8 +21,8 @@ change (silence is the default state of the file):
 | `stream` | string | the config's `stream_id` |
 | `frame` | u32 | frame number in the source's own sequence — the seek key into file footage |
 | `wall_us` | u64 | ledger-write time, epoch µs |
-| `t_capture_us` | u64 | frame capture time, epoch µs — the seek key into timestamped footage. For `index`, the footage's own timeline (see the ingest header for how the epoch anchor is derived) |
-| `verdict_latency_ms` | f64, 3 dp | capture → ledger write, including that frame's embed time |
+| `t_capture_us` | u64 | frame capture time, epoch µs — the seek key into timestamped footage. For `index`, the footage's own timeline, anchored as the lens's `time_anchor` records (see lens.txt) |
+| `verdict_latency_ms` | f64, 3 dp | capture → ledger write, including that frame's embed time. For `watch` that is detection latency; for `index` the capture times are the footage's own timeline, so the same number measures *processing lag behind the footage timeline* — the run summary says which, in its `verdict_latency_basis` field. The ledger field keeps its name in both worlds (format compatibility); the label lives at presentation |
 | `changed_tiles` | [u32] | tiles published changed, row-major over the ledger's grid (in `lens.txt`) |
 | `focus` | [u32] | the director's top-`focus_k` tiles by raw score — the attention record; it does not gate compute |
 | `lineage_mask` | u64 | bitmask of cascade stages that touched the verdict (bits 0–4: perceive, decide, direct, refine, publish; a full pass = 31) |
@@ -35,8 +35,13 @@ change (silence is the default state of the file):
 `{"kind":"service","event":…,"msg":…,"wall_us":…}`. Events
 include `start`, `stop`, `embedder`, `embedder_start`,
 `embedder_stop`, the freshness receipts `source_frozen` /
-`source_recovered` (see health.txt), and `embedder_swap`
-(see "Embedder identity and the swap rule" below).
+`source_recovered` (see health.txt), `embedder_swap`
+(see "Embedder identity and the swap rule" below), and
+`degenerate_embedder` — the receipt of a stopped run: an
+embedding that cannot carry a score (zero norm, non-finite)
+was refused at a named frame and tile, and the run ended
+there rather than author tells from it (playtest F1; the
+run's error is the typed `DegenerateEmbedding` refusal).
 
 ## Embedder identity and the swap rule
 
@@ -45,12 +50,16 @@ Every ledger records **which embedder produced its tells**:
 version is declared, or `unknown` when the operator declared
 none) appears in lens.txt, state.txt and health.txt. The
 identity comes from the config keys `embedder_name` /
-`embedder_version`; the `index` verb derives it from the
-adapter its own config selects when those keys are unset —
+`embedder_version`; when those keys are unset, **both** verbs
+derive it from the adapter the config itself selects —
 `double@1` for the built-in test double (it reports itself
 honestly as the double), `http@<endpoint URL>` for the
 generic HTTP adapter (the URL is the only version a generic
-endpoint has).
+endpoint has). (Before v0.3.1 only `index` derived it; a
+`watch` run left undeclared stamped `unknown`, and declaring
+the true identity afterwards — as this section teaches — was
+then refused against the tutorial's own ledger. The cold
+playtest found that trap; F2 closed it.)
 
 This exists because the width guard is not enough (deficit
 D1): two embedders of the *same width* still live in
@@ -85,7 +94,22 @@ and the ledger carries a recorded identity from then on.
 
 `key = value` lines: `stream_id`; **`grid`** (`RxC` — the
 geometry every tile number in this ledger is read against);
-**`embedder_identity`** (see above); `period_ms` / `jitter_ms`
+**`embedder_identity`** (see above); **`source_kind`** —
+`live` or `footage` (an `index` run): freshness accounting
+applies to live sources only, and readers (e.g. `query
+--summary`) present frozen stretches only for live ledgers;
+**`time_anchor`** — how the ledger's capture times were
+anchored to the epoch: `capture_clock` for live sources
+(frames stamped as they arrive); for indexed footage,
+`operator_start_us` (the operator supplied frame 0's epoch),
+`file_mtime_minus_duration` (the footage file's mtime minus
+its probed duration), or `file_mtime`. Indexed tells' wall
+times inherit the anchor's truth: for an NVR export, mtime
+is export/copy time, so `file_mtime*` anchors are labelled
+approximations, while frame numbers — the other seek key —
+are always exact. (Ledgers written before v0.3.1 record
+neither line; their anchor was the ingest's derivation,
+unstamped.) `period_ms` / `jitter_ms`
 (frame-arrival rhythm EMAs, or `unknown`); `threshold`;
 `alpha`; `gate_diff` (when the ingest reported one);
 `frames_observed`; `tile_score_ema` (space-separated per-tile
@@ -129,13 +153,20 @@ what makes quiet meaningful — or says it isn't:
 - `embedder` — `up` / `down`.
 - `embedder_identity` — the embedder that produced this
   ledger's tells (see "Embedder identity and the swap rule").
-- **`freshness`** — `live` / `frozen` / `unknown`. Freshness is
-  proven by *image novelty*: the ingest hashes each frame, and
-  a frame identical to its predecessor is a repeat. `frozen` =
-  the last 2+ frames were repeats: the poll is succeeding and
-  nothing is being seen. `unknown` = no hash data has arrived
-  (an ingest too old to stamp it) — a distinct state, never
-  dressed as live.
+- **`freshness`** — `live` / `frozen` / `unknown` / `footage`.
+  Freshness is proven by *image novelty*: the ingest hashes
+  each frame, and a frame identical to its predecessor is a
+  repeat. `frozen` = the last 2+ frames were repeats: the poll
+  is succeeding and nothing is being seen. `unknown` = no hash
+  data has arrived (an ingest too old to stamp it) — a
+  distinct state, never dressed as live. `footage` = the
+  source is recorded footage (an `index` run): the frozen
+  distinction does not apply — a file cannot die mid-watch,
+  its repeated frames are content the tool watched, and its
+  silence keeps its meaning (`silence_meaningful` below is
+  not withdrawn). Before v0.3.1, index runs inherited the
+  live accounting and a static scene's ledger ended
+  `freshness = frozen` — the playtest's category error, F3.
 - `frames_novel` / `frames_repeated` / `consecutive_repeats` —
   the novelty counters behind the state.
 - **`silence_meaningful`** — true only when the embedder is
@@ -153,9 +184,10 @@ meets: the ingest writes one JSON record per embedded tile —
 `{"seq","frame","tile","t_arrival_us","diff_score","embed_ms",
 "embedding":[…]}` — and one control line per frame:
 `{"control":"frame_end","frame","t_capture_us","nominated",
-"gate_diff","frame_hash","frame_repeat"}`. The codec is
-`harbor_watch::record`; `frame_hash`/`frame_repeat` are the
-freshness stamps health.txt is computed from.
+"gate_diff","frame_hash","frame_repeat","time_anchor"}`. The
+codec is `harbor_watch::record`; `frame_hash`/`frame_repeat`
+are the freshness stamps health.txt is computed from, and
+`time_anchor` is the anchor stamp the lens records (above).
 
 ## Reading a ledger with shelf tools
 

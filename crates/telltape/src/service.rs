@@ -32,6 +32,13 @@
 //! `--recalibrate`), in which case the swap is receipted in the
 //! ledger's own event stream and the run starts from fresh
 //! baselines, exactly as a lens change would.
+//!
+//! Degenerate embeddings (playtest F1): the cascade refuses any
+//! record whose embedding cannot carry a score (zero norm,
+//! non-finite), and this loop receipts that refusal as a
+//! `degenerate_embedder` service event — frame and tile named —
+//! before returning the typed error. A broken embedder stops
+//! the watch; it never gets to author a confident ledger.
 
 use crate::config::{Config, ConfigError};
 use crate::ledger::{epoch_us, Ledger, RecordedIdentity};
@@ -135,6 +142,16 @@ pub struct Summary {
     pub embed_everything_estimate_s: f64,
     pub verdict_latency_p50_ms: f64,
     pub verdict_latency_max_ms: f64,
+    /// What the latency numbers above measure (playtest F4).
+    /// For a live run, capture → ledger write is detection
+    /// latency: `capture_to_ledger_write`. For an index run the
+    /// capture times are the footage's own timeline, so the
+    /// same arithmetic measures how far behind that timeline
+    /// the indexer was when it wrote the verdict:
+    /// `processing_lag_behind_footage_timeline`. The ledger's
+    /// field keeps its name (format compatibility); the label
+    /// lives here, at presentation.
+    pub verdict_latency_basis: &'static str,
     pub embedder_started_by_me: bool,
     pub embedder_stopped_by_me: bool,
 }
@@ -232,7 +249,7 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
     // operator explicitly recalibrates; a swap is a lens change
     // and silently continuing on the old baselines must be
     // impossible.
-    let configured_identity = cfg.embedder_identity();
+    let configured_identity = cfg.run_identity();
     let recalibrated_from: Option<String> = match Ledger::probe_identity(&cfg.ledger_dir) {
         RecordedIdentity::New => None,
         RecordedIdentity::Known(id) if id == configured_identity => None,
@@ -266,6 +283,19 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
         grid,
         &configured_identity,
     )?;
+    // Footage mode (playtest F3) and the time anchor (F8). The
+    // ingest stamps the anchor it actually used on every
+    // frame_end; until the first stamp arrives a footage ledger
+    // says `unstamped` rather than guess, unless the operator
+    // supplied the start epoch themselves.
+    ledger.footage = cfg.source_footage;
+    if cfg.source_footage {
+        ledger.time_anchor = if cfg.index_start_us > 0 {
+            "operator_start_us".to_string()
+        } else {
+            "unstamped".to_string()
+        };
+    }
     ledger
         .service_event("start", &format!("stream {} starting", cfg.stream_id))
         .ok();
@@ -357,6 +387,7 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
     };
     let mut pipeline: Option<LivePipeline> = None;
     let mut prev_frame_hash: Option<String> = None;
+    let mut anchor_stamped = false;
     let mut pending: Vec<InputRecord> = Vec::new();
     let mut pending_embed_ms: Vec<f64> = Vec::new();
     let mut last_frame_wall: Option<std::time::Instant> = None;
@@ -383,6 +414,17 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
                 let frame = json_num(line, "frame").unwrap_or(0.0) as u32;
                 let t_capture_us = json_num(line, "t_capture_us").unwrap_or(0.0) as u64;
                 let nominated = json_num(line, "nominated").unwrap_or(0.0) as u64;
+                // Time anchor (playtest F8): the ingest stamps
+                // how its capture times were derived; the first
+                // stamp is the run's anchor and the lens records
+                // it, so a reader knows what the tells' wall
+                // times rest on.
+                if !anchor_stamped {
+                    if let Some(a) = json_str(line, "time_anchor") {
+                        ledger.time_anchor = a;
+                        anchor_stamped = true;
+                    }
+                }
                 if let Some(g) = json_num(line, "gate_diff") {
                     ledger.gate_diff = Some(g);
                 }
@@ -447,7 +489,38 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
                     let emb_ms = std::mem::take(&mut pending_embed_ms);
                     let embedded = recs.len() as u64;
                     let pending_now = frames_received - frames_processed - 1;
-                    let out = p.process_frame(frame, recs)?;
+                    let out = match p.process_frame(frame, recs) {
+                        Ok(out) => out,
+                        Err(e) => {
+                            // Playtest F1: a degenerate embedding
+                            // stops the run, and the stop is
+                            // receipted in the ledger itself —
+                            // the tell reader must be able to see
+                            // why the tells end, with the frame
+                            // and tile that carried the defect.
+                            // Tells written before this frame
+                            // stand; nothing is written from the
+                            // degenerate vector.
+                            if let PipelineError::DegenerateEmbedding {
+                                frame: df,
+                                tile,
+                                reason,
+                                ..
+                            } = e
+                            {
+                                ledger
+                                    .service_event(
+                                        "degenerate_embedder",
+                                        &format!(
+                                            "degenerate embedding refused at frame {df} tile {tile} ({reason}); run stopped — a broken embedder must not produce a confident ledger"
+                                        ),
+                                    )
+                                    .ok();
+                                ledger.write_all().ok();
+                            }
+                            return Err(e.into());
+                        }
+                    };
                     if let Some(lat) = ledger.record_frame(
                         &out,
                         t_capture_us,
@@ -522,6 +595,11 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
     let (p50, _) = crate::ledger::percentiles(&verdict_latencies);
     summary.verdict_latency_p50_ms = p50;
     summary.verdict_latency_max_ms = verdict_latencies.iter().cloned().fold(0.0, f64::max);
+    summary.verdict_latency_basis = if cfg.source_footage {
+        "processing_lag_behind_footage_timeline"
+    } else {
+        "capture_to_ledger_write"
+    };
     summary.embedder_started_by_me = embedder_started_by_me;
 
     // ---- embedder lifecycle: restore as found

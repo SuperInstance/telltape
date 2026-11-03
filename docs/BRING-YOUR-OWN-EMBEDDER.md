@@ -44,6 +44,20 @@ seam.
   startup with a synthetic tile and fails loudly there — a
   width mismatch is a startup error, never a per-tile surprise
   mid-stream.
+- **Non-degeneracy:** the vector must carry information —
+  every component finite, and a finite, non-zero norm. The
+  startup probe checks this too, and the pipeline re-checks
+  every embedding it is handed, mid-stream included: a
+  degenerate vector (a dead model returning zeros, an
+  endpoint returning placeholder NaNs) stops the run with a
+  typed refusal, receipted in the ledger as a
+  `degenerate_embedder` service event. This rule exists
+  because the failure it prevents is silent and confident:
+  a zero vector is at maximal cosine distance from
+  *everything*, so an unchecked seam turns a broken embedder
+  into a ledger of maximal "changes" that are really just
+  pixel-diff nominations. (A cold playtest reproduced exactly
+  that with the sketch below; v0.3.1 closed it.)
 - **Latency:** measured client-side per call and carried in
   the record stream (`embed_ms`); the ledger's budget meter is
   built from it, so an honest service needs no instrumentation
@@ -62,7 +76,13 @@ import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 def embed(png_bytes):            # <-- your model lives here
-    return [0.0] * 1280          # return its real vector
+    return [0.0] * 1280          # return its real vector —
+                                 # as written, this placeholder
+                                 # is degenerate and the startup
+                                 # probe will refuse it (by design:
+                                 # see Non-degeneracy above). The
+                                 # sketch is the shape, not a
+                                 # runnable embedder.
 
 class H(BaseHTTPRequestHandler):
     def do_POST(self):

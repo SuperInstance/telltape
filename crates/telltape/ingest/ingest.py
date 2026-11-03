@@ -9,7 +9,14 @@ tile) plus a frame_end control line per frame:
   {"seq":0,"frame":F,"tile":T,"t_arrival_us":<capture epoch us>,
    "diff_score":D,"embed_ms":M,"embedding":[<embed_dim> floats]}
   {"control":"frame_end","frame":F,"t_capture_us":<capture epoch us>,
-   "nominated":K,"gate_diff":G,"frame_hash":H,"frame_repeat":false}
+   "nominated":K,"gate_diff":G,"frame_hash":H,"frame_repeat":false,
+   "time_anchor":A}
+
+   A names how the capture times were anchored (playtest F8):
+   capture_clock for live sources; for the file source, the
+   derivation file_frames used (operator_start_us /
+   file_mtime_minus_duration / file_mtime). The service records
+   it in the ledger's lens.
 
 Sources (identical interface — the service cannot tell them apart):
   staged   staged-events sequence (cut / object / drift) composited
@@ -120,6 +127,24 @@ def frame_hash(frame):
 
 # ---------------- embedder seam ----------------
 
+def degenerate_reason(vec):
+    """Why an embedding is degenerate — unable to carry a score —
+    or None when it is sound: a non-finite component, a
+    non-finite norm, or a zero norm. This is the same rule the
+    Rust cascade enforces on every record (playtest F1): a
+    vector that carries no information must never become a
+    score, at the probe or mid-stream."""
+    v = np.asarray(vec, dtype=np.float64)
+    if not np.all(np.isfinite(v)):
+        return "non-finite component"
+    n = float(np.linalg.norm(v))
+    if not np.isfinite(n):
+        return "non-finite norm"
+    if n == 0.0:
+        return "zero norm"
+    return None
+
+
 class Embedder:
     """The seam: embed(tile_img) -> (vector, embed_ms).
 
@@ -135,13 +160,23 @@ class Embedder:
         raise NotImplementedError
 
     def probe(self):
-        """Embed one tiny synthetic tile and verify the width."""
+        """Embed one tiny synthetic tile and verify the result:
+        the width, AND that the vector is not degenerate
+        (playtest F1 — the probe used to check width only, so a
+        service returning a zero vector for every tile passed
+        it and went on to author a confident, wrong ledger)."""
         tile = np.zeros((8, 8, 3), dtype=np.float32)
         vec, _ = self.embed(tile)
         if len(vec) != self.dim:
             raise RuntimeError(
                 f"embedder {self.name}: probe returned dim {len(vec)}, "
                 f"expected {self.dim} — fix --embed-dim or the service")
+        reason = degenerate_reason(vec)
+        if reason is not None:
+            raise RuntimeError(
+                f"embedder {self.name}: probe embedding is degenerate "
+                f"({reason}) — a vector with no information cannot "
+                f"be scored; refusing to start")
         return True
 
 
@@ -240,6 +275,12 @@ class Emitter:
         self.cols = cols
         self.prev_tiles = None
         self.prev_hash = None
+        # How capture times are anchored to the epoch (playtest
+        # F8), stamped on every frame_end so the service can
+        # record it in the ledger's lens: live sources stamp
+        # capture_clock; the file source stamps the derivation
+        # it actually used (see file_anchor_kind).
+        self.time_anchor = "capture_clock"
 
     def embed(self, tile_img):
         vec, ms = self.embedder.embed(tile_img)
@@ -279,7 +320,8 @@ class Emitter:
                           "nominated": len(nominated),
                           "gate_diff": self.gate,
                           "frame_hash": h,
-                          "frame_repeat": repeat}), flush=True)
+                          "frame_repeat": repeat,
+                          "time_anchor": self.time_anchor}), flush=True)
         self.prev_tiles = tls
         return len(nominated)
 
@@ -450,6 +492,26 @@ def _probe_duration_s(path):
         return None
 
 
+def file_anchor_kind(path, start_us):
+    """Which time anchor file_frames will use for this source
+    (playtest F8), named so the service can record it in the
+    ledger's lens: an operator-supplied start epoch; the file's
+    mtime minus its probed duration (a video); or the file's
+    mtime alone (image material, or a video whose duration
+    cannot be probed). The anchor is the truth the indexed
+    tells' wall times inherit — for an NVR export, mtime is
+    export time, and the lens saying so is the difference
+    between a labelled approximation and a silent error."""
+    if start_us:
+        return "operator_start_us"
+    if os.path.isdir(path) or any(ch in path for ch in "*?[") \
+            or path.lower().endswith(IMG_EXTS):
+        return "file_mtime"
+    if _probe_duration_s(path):
+        return "file_mtime_minus_duration"
+    return "file_mtime"
+
+
 def file_frames(path, fps, start_us):
     """Yield (frame, t_capture_us) for existing footage.
 
@@ -579,6 +641,8 @@ def main():
               f"each 1..=16, at least 2 tiles)", file=sys.stderr)
         return 2
     em = Emitter(embedder, args.gate, grows, gcols)
+    if args.source == "file" and args.file:
+        em.time_anchor = file_anchor_kind(args.file, args.start_us)
     timed = args.source == "file"
     if args.source == "staged":
         frames, truth = staged_frames(grows, gcols)

@@ -52,7 +52,10 @@ frame nominates none; every C landing nominates all 16. It does
 so by replacing only the rack call inside the real `Emitter`
 with a recorder — the embeddings in that run are placeholders
 and **no verdict claim is made from them**. The verdict layer
-(I-JEPA embedding distances → cascade → published events) still
-requires a live JEV rack (`POST /embed/image`); with one up, the
-full acceptance is `../acceptance.sh` on a Thor-class box, now
-against these same fixtures by default.
+(embedding distances → cascade → published events) is exercised
+against these same fixtures by `../acceptance.sh`: the
+canonical staged acceptance through the built-in test double,
+printing the expected-vs-measured table. Verdicts from a real
+embedder (I-JEPA on the fleet's rack) carry their own measured
+record — see docs/EXAMPLES.md — and are not what this script
+re-runs.

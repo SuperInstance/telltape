@@ -8,9 +8,13 @@
 //! (video file, image sequence, or single image) from the same
 //! config a `watch` run uses, then hands it to the *identical*
 //! service loop. An index ledger therefore means exactly what a
-//! watch ledger means — same tiling, same gate, same verdicts,
-//! same freshness accounting (a static stretch of footage reads
-//! frozen, because it is).
+//! watch ledger means — same tiling, same gate, same verdicts.
+//! One accounting differs, deliberately (playtest F3): freshness
+//! is a live-source property, so footage runs are marked
+//! (`source_footage`) and their ledgers never declare the
+//! source frozen or withdraw meaning from their silence — a
+//! static stretch of footage is content the tool watched, not
+//! a feed that died.
 //!
 //! The embedder for the composed command follows the config's
 //! own statement: a non-empty `embed_url` means the generic HTTP
@@ -115,6 +119,7 @@ fn declare_adapter_identity(run_cfg: &mut Config) {
 pub fn index_file(cfg: &Config, source: &str) -> Result<Summary, ServiceError> {
     let mut run_cfg = cfg.clone();
     run_cfg.ingest_cmd = index_ingest_cmd(cfg, source)?;
+    run_cfg.source_footage = true;
     declare_adapter_identity(&mut run_cfg);
     service::run(&run_cfg)
 }

@@ -216,7 +216,7 @@ fn run_export_cli(args: &[String]) -> ! {
 
 fn print_summary(s: &service::Summary) {
     println!(
-        "{{\"frames\":{},\"events\":{},\"embeds\":{},\"embeds_spent_s\":{:.3},\"embed_everything_estimate_s\":{:.3},\"verdict_latency_p50_ms\":{:.3},\"verdict_latency_max_ms\":{:.3},\"embedder_started_by_me\":{},\"embedder_stopped_by_me\":{}}}",
+        "{{\"frames\":{},\"events\":{},\"embeds\":{},\"embeds_spent_s\":{:.3},\"embed_everything_estimate_s\":{:.3},\"verdict_latency_p50_ms\":{:.3},\"verdict_latency_max_ms\":{:.3},\"verdict_latency_basis\":\"{}\",\"embedder_started_by_me\":{},\"embedder_stopped_by_me\":{}}}",
         s.frames,
         s.events,
         s.embeds,
@@ -224,6 +224,7 @@ fn print_summary(s: &service::Summary) {
         s.embed_everything_estimate_s,
         s.verdict_latency_p50_ms,
         s.verdict_latency_max_ms,
+        s.verdict_latency_basis,
         s.embedder_started_by_me,
         s.embedder_stopped_by_me
     );
@@ -271,6 +272,18 @@ fn main() {
                     "usage: telltape watch --config <file> [--recalibrate]\n       telltape index <footage> --config <file> [--fps N] [--recalibrate]\n       telltape query <ledger-dir> [--since T] [--until T] [--tile N] [--stream ID] [--summary]\n       telltape export <ledger-dir> [--format json|csv] [--out FILE] [--since T] [--until T] [--tile N] [--stream ID]\n       (--recalibrate acknowledges an embedder swap against an existing ledger)"
                 );
                 std::process::exit(0);
+            }
+            // Playtest F6: a bare word that is not a verb is a
+            // usage error, named as one — it used to fall through
+            // to `watch` and report a missing default config,
+            // pointing the user at the wrong problem entirely.
+            // (A leading flag is the documented bare watch form:
+            // `telltape --config f` means watch.)
+            _ if !first.starts_with('-') => {
+                eprintln!(
+                    "telltape: unknown verb {first:?} — the verbs are watch, index, query, export\nusage: telltape watch --config <file> [--recalibrate]\n       telltape index <footage> --config <file> [--fps N] [--recalibrate]\n       telltape query <ledger-dir> [--since T] [--until T] [--tile N] [--stream ID] [--summary]\n       telltape export <ledger-dir> [--format json|csv] [--out FILE] [--since T] [--until T] [--tile N] [--stream ID]"
+                );
+                std::process::exit(2);
             }
             _ => {}
         }

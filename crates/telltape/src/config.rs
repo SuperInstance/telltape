@@ -42,10 +42,13 @@ pub struct Config {
     /// rotation, so a ledger that cannot say WHICH embedder
     /// produced its tells cannot be trusted across a swap — the
     /// width guard alone passes a same-width swap silently).
-    /// Empty = undeclared; the run's identity is then `unknown`,
-    /// which is stamped as such, never dressed as a real name.
-    /// `index` fills this in from the adapter its own config
-    /// selects when the operator leaves it empty.
+    /// Empty = undeclared; [`Config::embedder_identity`] then
+    /// reads `unknown`, which is stamped as such, never dressed
+    /// as a real name. A *run*, however, records
+    /// [`Config::run_identity`]: when the name is undeclared,
+    /// the identity of the adapter the config itself selects
+    /// (the derivation `index` has always applied; `watch`
+    /// shares it since the playtest's F2).
     pub embedder_name: String,
     /// The embedder's version string (model / algorithm version),
     /// the second half of the identity. For the generic HTTP
@@ -113,6 +116,14 @@ pub struct Config {
     /// Capture epoch (µs) of frame 0 for `index`; 0 = derive
     /// from the footage file (mtime minus probed duration).
     pub index_start_us: u64,
+    /// The source is recorded footage, not a live feed (set by
+    /// the `index` verb; a `watch` config whose `ingest_cmd`
+    /// replays files may set it too). Freshness accounting is a
+    /// live-source property (playtest F3): a file cannot die
+    /// mid-watch, so for footage the ledger does not declare
+    /// the source frozen, does not withdraw meaning from its
+    /// silence, and stamps its lens `source_kind = footage`.
+    pub source_footage: bool,
 }
 
 impl Default for Config {
@@ -145,6 +156,7 @@ impl Default for Config {
             ingest_script: String::new(),
             index_fps: 2.0,
             index_start_us: 0,
+            source_footage: false,
         }
     }
 }
@@ -169,6 +181,29 @@ impl Config {
             self.embedder_name.clone()
         } else {
             format!("{}@{}", self.embedder_name, self.embedder_version)
+        }
+    }
+
+    /// The identity this run records in its ledger: the
+    /// declared identity ([`Config::embedder_identity`]) when
+    /// the operator declared a name; otherwise the identity of
+    /// the adapter this config itself selects — the derivation
+    /// `index` has applied since D1, shared with `watch` since
+    /// the cold playtest (F2: a `watch` run left undeclared
+    /// stamped `unknown` while `index` stamped the truth, and
+    /// the tutorial's own first ledger then refused the
+    /// identity the format doc taught the operator to declare).
+    /// An empty `embed_url` selects the ingest's built-in test
+    /// double (`double@1`); a set one selects the generic HTTP
+    /// adapter, whose only version is its endpoint URL.
+    pub fn run_identity(&self) -> String {
+        if !self.embedder_name.is_empty() {
+            return self.embedder_identity();
+        }
+        if self.embed_url.is_empty() {
+            "double@1".to_string()
+        } else {
+            format!("http@{}", self.embed_url)
         }
     }
 
@@ -289,6 +324,9 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
     }
     if let Some(v) = boolean("recalibrate", "recalibrate")? {
         cfg.recalibrate = v;
+    }
+    if let Some(v) = boolean("source_footage", "source_footage")? {
+        cfg.source_footage = v;
     }
     if let Some(v) = num("threshold")? {
         cfg.threshold = v;
@@ -412,6 +450,32 @@ mod tests {
             .unwrap_err()
             .0
             .contains("recalibrate"));
+    }
+
+    /// Playtest F2: a run left undeclared records the identity
+    /// of the adapter its own config selects — for BOTH verbs —
+    /// so a first ledger never stamps `unknown` for an embedder
+    /// the config actually names by its shape.
+    #[test]
+    fn run_identity_derives_from_the_selected_adapter() {
+        // No embed URL: the ingest's test double is selected.
+        let c = parse_config("").unwrap();
+        assert_eq!(c.run_identity(), "double@1");
+        // A set embed URL: the generic HTTP adapter, URL as version.
+        let c = parse_config("embed_url = http://h:9/embed\n").unwrap();
+        assert_eq!(c.run_identity(), "http@http://h:9/embed");
+        // A declared identity is the operator's word; keep it.
+        let c = parse_config("embed_url = http://h:9/embed\nembedder_name = jev-rack\nembedder_version = ijepa-1.0\n").unwrap();
+        assert_eq!(c.run_identity(), "jev-rack@ijepa-1.0");
+        // And the declared-identity reader itself is unchanged:
+        // undeclared still reads honestly as `unknown` there.
+        assert_eq!(parse_config("").unwrap().embedder_identity(), "unknown");
+        assert!(!parse_config("").unwrap().source_footage);
+        assert!(
+            parse_config("source_footage = true\n")
+                .unwrap()
+                .source_footage
+        );
     }
 
     #[test]

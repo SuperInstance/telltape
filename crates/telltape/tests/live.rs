@@ -185,13 +185,126 @@ fn frozen_source_reads_frozen_not_meaningful_silence() {
     assert!(events.contains("source_frozen"), "{events}");
 }
 
+/// Playtest F1 — the seam, at the service level: a record whose
+/// embedding is degenerate (here: a dead embedder's all-zeros
+/// placeholder, then a NaN variant) must stop the run with a
+/// typed refusal, receipted in the ledger as a
+/// `degenerate_embedder` service event naming the frame and
+/// tile. No verdict may be written from it, and no quiet
+/// continuation may follow it.
+#[test]
+fn degenerate_record_stops_the_run_and_is_receipted() {
+    for (tag, bad_emb) in [("zero", vec![0.0f32; 128]), ("nan", vec![f32::NAN; 128])] {
+        let fx = fixture::generate(128, 7);
+        let dir = tempdir(tag);
+        let recs_path = format!("{dir}/records.jsonl");
+        let now = telltape::ledger::epoch_us();
+        {
+            let mut f = std::fs::File::create(&recs_path).unwrap();
+            for r in fx.records.iter().filter(|r| r.frame == 0) {
+                writeln!(f, "{}", record_to_json(r)).unwrap();
+            }
+            writeln!(
+                f,
+                "{{\"control\":\"frame_end\",\"frame\":0,\"t_capture_us\":{now},\"nominated\":16,\"gate_diff\":3.0}}"
+            )
+            .unwrap();
+            let bad = harbor_watch::record::InputRecord {
+                seq: 99,
+                frame: 1,
+                tile: 3,
+                t_arrival_us: now,
+                diff_score: 9.0,
+                embedding: bad_emb,
+            };
+            writeln!(f, "{}", record_to_json(&bad)).unwrap();
+            writeln!(
+                f,
+                "{{\"control\":\"frame_end\",\"frame\":1,\"t_capture_us\":{now},\"nominated\":1,\"gate_diff\":3.0}}"
+            )
+            .unwrap();
+        }
+        let cfg = Config {
+            stream_id: "deg-stream".into(),
+            ledger_dir: format!("{dir}/ledger"),
+            ingest_cmd: format!("cat {recs_path}"),
+            embed_url: String::new(),
+            ..Config::default()
+        };
+        match service::run(&cfg) {
+            Err(service::ServiceError::Pipeline(
+                harbor_watch::pipeline::PipelineError::DegenerateEmbedding {
+                    frame: 1,
+                    tile: 3,
+                    ..
+                },
+            )) => {}
+            other => panic!("{tag}: expected a typed degenerate refusal, got {other:?}"),
+        }
+        let events = std::fs::read_to_string(format!("{dir}/ledger/events.jsonl")).unwrap();
+        assert!(
+            events.contains("\"event\":\"degenerate_embedder\""),
+            "{tag}: the stop must be receipted: {events}"
+        );
+        assert!(events.contains("frame 1 tile 3"), "{tag}: {events}");
+        assert!(
+            !events.contains("\"kind\":\"verdict\""),
+            "{tag}: no verdict may be written: {events}"
+        );
+    }
+}
+
+/// Playtest F2 — the docs flow, end to end: a first `watch`
+/// run whose config declares no identity stamps the identity
+/// of the adapter its config selects (`double@1` — no embed
+/// URL), so when the operator then does what LEDGER-FORMAT
+/// teaches — declare that identity explicitly — the run is an
+/// ordinary resume, NOT the mismatch refusal the playtester
+/// hit against the tutorial's own ledger. (Before F2 the first
+/// run stamped `unknown` and the second was refused.)
+#[test]
+fn watch_stamps_the_selected_adapter_identity() {
+    let dir = tempdir("watch-id");
+    let base = Config {
+        stream_id: "s".into(),
+        ledger_dir: format!("{dir}/ledger"),
+        ingest_cmd: "true".into(),
+        embed_url: String::new(),
+        ..Config::default()
+    };
+    service::run(&base).expect("first run stamps the ledger");
+    let lens = std::fs::read_to_string(format!("{dir}/ledger/lens.txt")).unwrap();
+    assert!(lens.contains("embedder_identity = double@1"), "{lens}");
+    // F8, live side: the lens declares a live source on the
+    // capture clock.
+    assert!(lens.contains("source_kind = live"), "{lens}");
+    assert!(lens.contains("time_anchor = capture_clock"), "{lens}");
+    // The format doc's flow: declare the identity, run again.
+    let declared = Config {
+        embedder_name: "double".into(),
+        embedder_version: "1".into(),
+        ..base.clone()
+    };
+    service::run(&declared).expect("declaring the stamped identity is a plain resume");
+}
+
 /// Slice 3.5 — `index` over an image sequence: five identical
-/// stills (a frozen stretch of footage), then a hard cut held for
-/// three frames. Replayed through the file source and the
-/// identical service loop, the ledger must show all 8 frames, a
-/// 16/16 verdict on the cut frame (frame 5), and a source_frozen
-/// receipt for the identical stretch — freshness accounting does
-/// not exempt recorded footage.
+/// stills, then a hard cut held for three frames. Replayed
+/// through the file source and the identical service loop, the
+/// ledger must show all 8 frames and a 16/16 verdict on the cut
+/// frame (frame 5).
+///
+/// REWRITTEN for playtest F3 (v0.3.1) — the previous form of
+/// this test asserted a `source_frozen` receipt for the
+/// identical stretch, on the theory that "freshness accounting
+/// does not exempt recorded footage". The cold playtest made
+/// the counter-argument from a user's chair: a static scene in
+/// a file finishes `freshness = frozen`,
+/// `silence_meaningful = false`, health reading like a failure
+/// — a category error. The file cannot die; the tool *did*
+/// watch every frame. Freshness is a live-source property:
+/// in footage, repeats are content. The verdicts below are
+/// unchanged — F3 moves receipts, not verdicts.
 #[test]
 fn index_replays_an_image_sequence_through_the_same_pipeline() {
     let dir = tempdir("index");
@@ -211,13 +324,29 @@ fn index_replays_an_image_sequence_through_the_same_pipeline() {
     let summary = telltape::index::index_file(&cfg, &seq).expect("index run");
     assert_eq!(summary.frames, 8);
     assert!(summary.events >= 1, "the cut must publish: {summary:?}");
+    // F4: the summary labels what its latency numbers measure
+    // for an index run.
+    assert_eq!(
+        summary.verdict_latency_basis,
+        "processing_lag_behind_footage_timeline"
+    );
     let events = std::fs::read_to_string(format!("{dir}/ledger/events.jsonl")).unwrap();
     assert!(events.contains("\"frame\":5"), "{events}");
     assert!(events.contains("\"changed_tiles\":[0, 1, 2"), "{events}");
-    assert!(events.contains("source_frozen"), "{events}");
+    // F3: no frozen receipt for footage, however many repeats.
+    assert!(!events.contains("source_frozen"), "{events}");
+    assert!(!events.contains("source_recovered"), "{events}");
+    let health = std::fs::read_to_string(format!("{dir}/ledger/health.txt")).unwrap();
+    assert!(health.contains("freshness = footage"), "{health}");
+    assert!(health.contains("silence_meaningful = true"), "{health}");
     // D1: index selected the test double, and the ledger says so.
     let lens = std::fs::read_to_string(format!("{dir}/ledger/lens.txt")).unwrap();
     assert!(lens.contains("embedder_identity = double@1"), "{lens}");
+    // F8: the lens declares the kind and the anchor this run's
+    // capture times were derived from (an image sequence is
+    // anchored at its first file's mtime).
+    assert!(lens.contains("source_kind = footage"), "{lens}");
+    assert!(lens.contains("time_anchor = file_mtime"), "{lens}");
 }
 
 /// D1 — the same-width swap. Both runs below would produce
@@ -328,9 +457,15 @@ fn legacy_ledger_requires_the_recalibrate_acknowledgement() {
     let events = std::fs::read_to_string(format!("{ledger_dir}/events.jsonl")).unwrap();
     assert!(events.contains("\"event\":\"embedder_swap\""), "{events}");
     assert!(events.contains("pre-0.1.1"), "{events}");
+    // F2 (v0.3.1): an undeclared config's run identity is no
+    // longer `unknown` — both verbs derive it from the adapter
+    // the config selects (here, no embed URL: the test double),
+    // exactly as `index` always did. The acknowledgement stamps
+    // that derived identity.
     let lens = std::fs::read_to_string(format!("{ledger_dir}/lens.txt")).unwrap();
-    assert!(lens.contains("embedder_identity = unknown"), "{lens}");
-    // Stamped now: an ordinary unknown-identity resume works.
+    assert!(lens.contains("embedder_identity = double@1"), "{lens}");
+    // Stamped now: an ordinary resume under the same derivation
+    // works without the flag.
     service::run(&cfg).expect("a stamped ledger resumes without the flag");
 }
 

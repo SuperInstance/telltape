@@ -770,6 +770,13 @@ pub(crate) struct LedgerData {
     pub(crate) identity: Option<String>,
     /// A lens exists but records no identity: a pre-0.1.1 ledger.
     pub(crate) legacy: bool,
+    /// The lens declares the source recorded footage
+    /// (`source_kind = footage`): frozen-source accounting is
+    /// a live-source property (playtest F3), so the summary
+    /// does not present frozen stretches for such a ledger.
+    /// Absent the line (pre-0.3.1 ledgers), the source reads
+    /// as live — the behaviour those ledgers were written under.
+    pub(crate) footage: bool,
     pub(crate) verdicts: Vec<VerdictRow>,
     pub(crate) service: Vec<ServiceRow>,
     /// Every parsed row, in ledger (file) order — the split
@@ -831,11 +838,13 @@ pub(crate) fn read_ledger(dir: &str) -> Result<LedgerData, QueryError> {
     // A ledger is legacy when it records no identity: a lens
     // without the line, or no lens at all (set in the branches).
     let mut legacy = true;
+    let mut footage = false;
     if let Ok(lens_text) = std::fs::read_to_string(root.join("lens.txt")) {
         let kv = read_kv(&lens_text);
         stream = kv_get(&kv, "stream_id").map(str::to_string);
         identity = kv_get(&kv, "embedder_identity").map(str::to_string);
         legacy = identity.is_none();
+        footage = kv_get(&kv, "source_kind") == Some("footage");
         if let Some(g) = kv_get(&kv, "grid") {
             let (r, c) = g.split_once('x').ok_or_else(|| {
                 QueryError::NotALedger(format!("{dir}/lens.txt records grid {g:?}, not RxC"))
@@ -891,6 +900,7 @@ pub(crate) fn read_ledger(dir: &str) -> Result<LedgerData, QueryError> {
         grid,
         identity,
         legacy,
+        footage,
         verdicts,
         service,
         ordered,
@@ -1204,14 +1214,23 @@ fn render_summary(
         t.push_str(&format!("  tile {tile}{ann}  {n}\n"));
     }
     // Frozen and stopped stretches, from the service rows.
-    let (frozen, frozen_orphans) = stretches(service, "source_frozen", "source_recovered");
+    // Frozen stretches are a live-source accounting (playtest
+    // F3): a footage ledger's lens says so, and the section is
+    // not presented for it — repeated frames in footage are
+    // content, and pairing them into "frozen stretches" would
+    // dress a category error as a finding.
     t.push('\n');
-    t.push_str(&render_stretches(
-        "frozen stretches (source_frozen -> source_recovered)",
-        &frozen,
-        frozen_orphans,
-        zone,
-    ));
+    if data.footage {
+        t.push_str("frozen stretches (source_frozen -> source_recovered)\n  (not applicable: this ledger is recorded footage — frozen-source accounting is a live-source property)\n");
+    } else {
+        let (frozen, frozen_orphans) = stretches(service, "source_frozen", "source_recovered");
+        t.push_str(&render_stretches(
+            "frozen stretches (source_frozen -> source_recovered)",
+            &frozen,
+            frozen_orphans,
+            zone,
+        ));
+    }
     let (stopped, stopped_orphans) = stretches(service, "stop", "start");
     t.push('\n');
     t.push_str(&render_stretches(

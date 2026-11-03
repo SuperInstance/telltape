@@ -113,6 +113,19 @@ impl LivePipeline {
                     tiles: self.tiles,
                 });
             }
+            // Playtest F1: every embedding is examined at the
+            // point it enters the pipeline, whichever adapter
+            // produced it. A degenerate vector (zero norm,
+            // non-finite) is refused before any state is touched
+            // — it must never become a score.
+            if let Some(reason) = harbor_watch::rng::degenerate_reason(&r.embedding) {
+                return Err(PipelineError::DegenerateEmbedding {
+                    seq: r.seq,
+                    frame: r.frame,
+                    tile: r.tile,
+                    reason,
+                });
+            }
         }
         let tiles = self.tiles;
         let t0 = std::time::Instant::now();
@@ -139,7 +152,7 @@ impl LivePipeline {
             let emb: Vec<f32> = unsafe { self.ingest.read_published(claim) }.to_vec();
             let score = self.prev_emb[t]
                 .as_ref()
-                .map(|p| harbor_watch::rng::cosine_distance(p, &emb));
+                .and_then(|p| harbor_watch::rng::cosine_distance(p, &emb));
             {
                 let mut lease = self.decide.lease();
                 lease.data_mut()[0] = score.unwrap_or(0.0) as f32;

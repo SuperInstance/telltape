@@ -175,6 +175,22 @@ pub struct Ledger {
     /// state.txt and health.txt; the comparability of rows
     /// across time is only defined within one identity.
     pub embedder_identity: String,
+    /// The source is recorded footage (an `index` run), not a
+    /// live feed. Freshness is a live-source property (playtest
+    /// F3): repeated frames in footage are content, not a dead
+    /// feed, so a footage ledger never declares itself frozen
+    /// and never withdraws meaning from its silence. Stamped
+    /// into lens.txt as `source_kind`.
+    pub footage: bool,
+    /// How this ledger's capture times are anchored to the
+    /// epoch (playtest F8): `capture_clock` for live sources
+    /// (frames stamped as they arrive); for indexed footage,
+    /// the anchor the footage's timeline was derived from —
+    /// `operator_start_us`, `file_mtime_minus_duration`, or
+    /// `file_mtime` — as stamped by the ingest on its frame_end
+    /// lines. Indexed tells' wall times inherit the anchor's
+    /// truth, and the lens says which anchor that was.
+    pub time_anchor: String,
 }
 
 impl Ledger {
@@ -239,6 +255,8 @@ impl Ledger {
             gate_diff: None,
             grid,
             embedder_identity: embedder_identity.to_string(),
+            footage: false,
+            time_anchor: "capture_clock".to_string(),
         };
         l.write_all()?;
         Ok(l)
@@ -350,6 +368,21 @@ impl Ledger {
     /// receipt it. This is the counter the frozen soak feed could
     /// not move: polls are not freshness; novelty is.
     pub fn observe_freshness(&mut self, repeated: bool) -> FreshnessTransition {
+        if self.footage {
+            // Playtest F3: freshness is a live-source property.
+            // In recorded footage a repeated frame is content —
+            // a static scene the tool did watch, frame by frame —
+            // not a feed that died. The counters still count the
+            // repeats (they are true), but no frozen transition
+            // can fire, so no alarm, no receipt, and silence in a
+            // footage ledger keeps its meaning.
+            if repeated {
+                self.stats.frames_repeated += 1;
+            } else {
+                self.stats.frames_novel += 1;
+            }
+            return FreshnessTransition::None;
+        }
         let was_frozen = self.stats.source_frozen();
         if repeated {
             self.stats.frames_repeated += 1;
@@ -382,6 +415,18 @@ impl Ledger {
         }
     }
 
+    /// The freshness value state.txt / health.txt report:
+    /// the stats' live-source verdict, or `footage` when this
+    /// ledger's source is recorded footage — neither live nor
+    /// frozen, because the distinction does not apply (F3).
+    pub fn freshness_label(&self) -> &'static str {
+        if self.footage {
+            "footage"
+        } else {
+            self.stats.freshness()
+        }
+    }
+
     pub fn write_all(&self) -> std::io::Result<()> {
         std::fs::write(self.path("lens.txt"), self.lens_text())?;
         std::fs::write(self.path("state.txt"), self.state_text())?;
@@ -395,6 +440,11 @@ impl Ledger {
         t.push_str(&format!("stream_id = {}\n", self.stream_id));
         t.push_str(&format!("grid = {}\n", self.grid));
         t.push_str(&format!("embedder_identity = {}\n", self.embedder_identity));
+        t.push_str(&format!(
+            "source_kind = {}\n",
+            if self.footage { "footage" } else { "live" }
+        ));
+        t.push_str(&format!("time_anchor = {}\n", self.time_anchor));
         t.push_str(&format!(
             "period_ms = {}\n",
             s.period_ms_ema
@@ -428,7 +478,7 @@ impl Ledger {
         t.push_str(&format!("frames_seen = {}\n", s.frames_seen));
         t.push_str(&format!("frames_novel = {}\n", s.frames_novel));
         t.push_str(&format!("frames_repeated = {}\n", s.frames_repeated));
-        t.push_str(&format!("freshness = {}\n", s.freshness()));
+        t.push_str(&format!("freshness = {}\n", self.freshness_label()));
         t.push_str(&format!("frames_changed = {}\n", s.frames_changed));
         t.push_str(&format!("events_published = {}\n", s.events_published));
         t.push_str(&format!(
@@ -485,7 +535,7 @@ impl Ledger {
             age_ms,
             if self.embedder_up { "up" } else { "down" },
             self.embedder_identity,
-            s.freshness(),
+            self.freshness_label(),
             s.frames_novel,
             s.frames_repeated,
             s.consecutive_repeats,
@@ -590,6 +640,49 @@ mod tests {
         let h = l.health_text();
         assert!(h.contains("freshness = frozen"), "{h}");
         assert!(h.contains("silence_meaningful = false"), "{h}");
+    }
+
+    /// Playtest F3: in a footage ledger, repeats are content.
+    /// They are counted, but they can never freeze the source,
+    /// never fire a transition, and silence keeps its meaning —
+    /// while the same sequence in a live ledger freezes exactly
+    /// as before (the frozen test above).
+    #[test]
+    fn footage_repeats_are_content_not_a_dead_feed() {
+        let dir = tempdir("footage");
+        let mut l =
+            Ledger::open(&dir, "s", 0.25, 0.1, false, Grid::default(), "test-emb@1").unwrap();
+        l.footage = true;
+        l.embedder_up = true;
+        l.stats.frames_seen = 6;
+        assert_eq!(l.observe_freshness(false), FreshnessTransition::None);
+        for _ in 0..5 {
+            assert_eq!(l.observe_freshness(true), FreshnessTransition::None);
+        }
+        assert!(!l.stats.source_frozen());
+        assert_eq!(l.stats.frames_repeated, 5, "repeats are still counted");
+        assert_eq!(l.freshness_label(), "footage");
+        let h = l.health_text();
+        assert!(h.contains("freshness = footage"), "{h}");
+        assert!(h.contains("silence_meaningful = true"), "{h}");
+        assert!(l.state_text().contains("freshness = footage"));
+        // The lens declares the kind and the time anchor (F8).
+        let lens = l.lens_text();
+        assert!(lens.contains("source_kind = footage"), "{lens}");
+        assert!(lens.contains("time_anchor = capture_clock"), "{lens}");
+        l.time_anchor = "file_mtime_minus_duration".to_string();
+        assert!(l
+            .lens_text()
+            .contains("time_anchor = file_mtime_minus_duration"));
+    }
+
+    #[test]
+    fn live_lens_stamps_source_kind_and_anchor() {
+        let dir = tempdir("livelens");
+        let l = Ledger::open(&dir, "s", 0.25, 0.1, false, Grid::default(), "test-emb@1").unwrap();
+        let lens = l.lens_text();
+        assert!(lens.contains("source_kind = live"), "{lens}");
+        assert!(lens.contains("time_anchor = capture_clock"), "{lens}");
     }
 
     /// P5 — the verdict row is the format strangers will parse; pin

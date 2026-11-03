@@ -383,6 +383,78 @@ fn binary_query_exit_codes_and_output() {
     assert_eq!(code, 2, "{stderr}");
 }
 
+/// Playtest F3, reader side: frozen stretches are a
+/// live-source accounting. A ledger whose lens declares
+/// `source_kind = footage` — even one carrying frozen receipts
+/// written by a pre-0.3.1 index run — must not have them paired
+/// into "frozen stretches" by the summary; the section states
+/// its inapplicability instead. (The service events themselves
+/// still list: they are history. The *accounting* is what is
+/// live-only.)
+#[test]
+fn summary_presents_no_frozen_stretches_for_a_footage_ledger() {
+    use std::io::Write as _;
+    let dir = tempdir("footage-summary");
+    std::fs::write(
+        format!("{dir}/lens.txt"),
+        "stream_id = yard\ngrid = 4x4\nembedder_identity = double@1\nsource_kind = footage\ntime_anchor = file_mtime\nperiod_ms = unknown\njitter_ms = unknown\nthreshold = 0.2500\nalpha = 0.1000\nframes_observed = 20\n",
+    )
+    .unwrap();
+    let rows = [
+        service_row("start", "stream yard starting", 1_793_649_590_000_000),
+        verdict_row("yard", 12, 1_793_649_700_000_000, &[5, 6], 2),
+        // Legacy artefact rows: an old index run receipted its
+        // static stretch as frozen. They stay in the listing;
+        // they must not become a "frozen stretch".
+        service_row(
+            "source_frozen",
+            "frame image stopped changing while polls continue; silence_meaningful = false",
+            1_793_649_800_000_000,
+        ),
+        service_row(
+            "source_recovered",
+            "novel frames arriving again after a frozen stretch",
+            1_793_649_900_000_000,
+        ),
+    ];
+    let mut f = std::fs::File::create(format!("{dir}/events.jsonl")).unwrap();
+    for r in rows {
+        writeln!(f, "{r}").unwrap();
+    }
+    drop(f);
+    let report = run_query(
+        &dir,
+        &QueryFilters {
+            summary: true,
+            ..Default::default()
+        },
+        &akst(),
+    )
+    .unwrap();
+    let t = &report.text;
+    assert!(
+        t.contains("not applicable: this ledger is recorded footage"),
+        "{t}"
+    );
+    assert!(!t.contains("(0s)"), "no zero-length stretch noise: {t}");
+    // And the live fixture's summary still pairs its stretch —
+    // the rule is kind-scoped, not a removal.
+    let live = run_query(
+        &fixture_a("footage-summary-live"),
+        &QueryFilters {
+            summary: true,
+            ..Default::default()
+        },
+        &akst(),
+    )
+    .unwrap();
+    assert!(
+        live.text.contains("frozen stretches") && !live.text.contains("not applicable"),
+        "{}",
+        live.text
+    );
+}
+
 #[test]
 fn binary_query_uses_the_local_zone() {
     if !std::path::Path::new("/usr/share/zoneinfo/America/Anchorage").exists() {

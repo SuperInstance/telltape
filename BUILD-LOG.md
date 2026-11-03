@@ -628,3 +628,131 @@ final live check.
 **Version**: all three workspace crates 0.2.0 → 0.3.0;
 tagged v0.3.0 locally. Not pushed — publication stays the
 gated step, as before.
+
+## The cold playtest fixes (2026-11-02, v0.3.1)
+
+This release exists because of a playtest, and the log should
+say so plainly: after v0.2.0 shipped, a zero-shot agent was
+given **only the public repo** and a job ("here's footage —
+tell me what changed, where, and when"), instructed to be
+uncharitable and to fix nothing. Its report
+(`~/workspace/cold-playtest/PLAYTEST-REPORT.md`, artefacts
+kept beside it) is the source of every item below. A hired
+hand validates; a cold user falsifies — the battery now has
+a playtest in it, and this release is what it bought.
+
+- **F1 (blocker) — a degenerate embedder could author a
+  perfect-looking, wrong ledger.** The playtester ran the
+  BYO doc's own sketch server verbatim — `embed()` returns
+  `[0.0] * 1280` — through the HTTP adapter and got the
+  canonical acceptance back, digit for digit: 18 frames,
+  2 events, 34 embeds, frame 4 = 16/16, frame 7 = {5, 6}.
+  The mechanism was in our own scorer: `cosine_distance`
+  returned **1.0 — maximal distance — for a zero-norm
+  vector**, so every tile the pixel gate nominated scored a
+  maximal "changed", and the gate's nominations on staged
+  material happen to be the ground truth. The startup probe
+  checked width only; health reported the embedder "up".
+  The fix is one rule, enforced at every point an embedding
+  can enter: *a vector with a non-finite component, a
+  non-finite norm, or a zero norm carries no information and
+  must never become a score.*
+  - The ingest's probe now checks degeneracy alongside
+    width, for every adapter through the shared base class —
+    the sketch server and a NaN variant refuse at startup,
+    loudly, before a frame exists.
+  - The cascade refuses such a record typed
+    (`PipelineError::DegenerateEmbedding`, frame and tile
+    named), in both the batch and live pipelines, before any
+    state is touched; the service receipts the stop in the
+    ledger as a `degenerate_embedder` service event and
+    returns the error. A mid-run degeneracy (healthy through
+    frame 0, zeros from frame 4) stops there: tells before
+    the frame stand, frame 4 publishes nothing, no quiet
+    continuation.
+  - Defence in depth: `cosine_distance` now returns
+    `Option<f64>` — `None` (no score, the unbaselined-tile
+    behaviour) for degenerate inputs — pinned by a unit test
+    at the rng level so the 1.0 answer cannot creep back.
+  - The hash double was proved unable to trip its own guard
+    (black / white / gradient / 200 random tiles + probe).
+  - Placement note: per-stream validation lives at the Rust
+    seam rather than in the Python emitter deliberately —
+    every adapter's records funnel through that one point,
+    and only there can the stop be receipted with frame/tile
+    context. The Python seam guards startup (probe) and
+    width, as before.
+- **F2 — the quickstart's identity trap.** The README's
+  acceptance config declared no embedder identity, so the
+  first ledger a new user created stamped `unknown`; doing
+  what LEDGER-FORMAT teaches (declare `double@1`) was then
+  refused against that very ledger, while `index` had been
+  stamping the truth all along. Now both verbs derive the
+  run identity from the adapter the config itself selects
+  when undeclared (`Config::run_identity`; `index`'s
+  derivation, shared), and the README config declares the
+  identity outright — the playtester's exact two-step,
+  replayed as a test, is now an ordinary resume.
+- **F3 — frozen-source semantics leaked into footage.** A
+  static scene in a *file* finished `freshness = frozen`,
+  `silence_meaningful = false`, with stderr alarms during
+  the run and 0-second "frozen stretches" in
+  `query --summary`. The live-feed alarm is a good idea
+  misapplied: a file cannot die, and the tool did watch
+  every frame. Freshness is now a live-source property:
+  footage runs are marked (`source_footage` / the lens's
+  `source_kind = footage`), repeats are counted as content
+  but can never freeze a footage ledger or withdraw its
+  silence's meaning, and `query --summary` presents frozen
+  stretches only for live-source ledgers. The existing
+  index test that asserted a `source_frozen` receipt for
+  identical stills is **rewritten**, with the playtest's
+  category-error argument cited in its doc comment —
+  verdicts in that test are byte-identical; only the
+  receipts moved.
+- **F4 — `verdict_latency_ms` read as detection latency in
+  index summaries** (29 s "p50" on a file processed in
+  3.6 s). It is processing lag behind the footage timeline.
+  No field rename (the ledger format is a compatibility
+  surface); the run summary now carries
+  `verdict_latency_basis` (`capture_to_ledger_write` /
+  `processing_lag_behind_footage_timeline`) and the format
+  doc labels the field in both worlds.
+- **F8 — indexed tells are anchored to the file's mtime,
+  and nothing said so in the ledger.** The lens now records
+  `time_anchor` (`capture_clock` / `operator_start_us` /
+  `file_mtime_minus_duration` / `file_mtime`), stamped by
+  the ingest on every frame_end from the derivation it
+  actually used, and LEDGER-FORMAT states the consequence:
+  an NVR export's mtime is export time, so a `file_mtime*`
+  anchor is a labelled approximation — while frame numbers,
+  the other seek key, are always exact.
+- **Warts.** `acceptance.sh` — cited by fixtures/README
+  and prove_fixtures' output, nonexistent (F5) — now exists
+  and prints the expected-vs-measured table (the fixtures
+  README's sentence about it is corrected to match what it
+  runs). Unknown verbs are refused as usage errors, exit 2,
+  verbs listed (F6: `telltape bogusverb` used to fall
+  through to watch and complain about a missing config).
+  The README's verb table gains the TZ note (F7: query
+  renders in `$TZ` / system zone / UTC, in that order).
+
+**Tests**: 130 → 144 passed (+1 pre-existing ignore);
+clippy `--all-targets -D warnings` clean; `cargo fmt`
+clean. New: rng scorer semantics (2), batch refusal (1),
+config derivation (1), ledger footage + stamps (2),
+service-level degenerate stop with receipt (zero and NaN),
+the F2 docs-flow replay, the rewritten index test, the
+query footage summary, and `tests/playtest.rs` (5) — the
+probe refusals asserted at the ingest's own stderr, the
+zero server's verdict-less ledger, the mid-run stop at
+frame 4 tile 3 with its receipt, the double's proof, the
+unknown verb. Staged acceptance untouched and re-run cold
+— through the new `acceptance.sh`: 18 frames, 34 embeds,
+2 events, frame 4 = 16/16, frame 7 = exactly {5, 6}, drift
+silent, spend 0.1181 — **PASS**, identical numbers, now
+under a seam that would have caught the playtest's server.
+
+**Version**: all three workspace crates 0.3.0 → 0.3.1;
+tagged v0.3.1 locally. Not pushed — publication stays the
+gated step, as before.

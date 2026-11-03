@@ -70,10 +70,22 @@ cat > acceptance.conf <<'EOF'
 stream_id = acceptance
 ledger_dir = ledger-acceptance
 ingest_cmd = python3 crates/telltape/ingest/ingest.py --source staged --embedder double
+embedder_name = double
+embedder_version = 1
 max_frames = 18
 EOF
 ./target/release/telltape watch --config acceptance.conf
 ```
+
+(The two `embedder_*` lines name the embedder this run's
+tells belong to — every ledger records its embedder's
+identity, and declaring it here is the habit the format doc
+builds on. Leave them out and the run derives the same
+identity from the config's own shape; declare a *different*
+one later and the ledger will refuse it as the swap it is —
+see docs/LEDGER-FORMAT.md. This whole run is also packaged
+as `crates/telltape/acceptance.sh`, which prints the
+expected-vs-measured table.)
 
 Expected shape of the run (measured; re-verified by the proof
 battery): 18 frames, **2 events, 34 embeds** — a verdict at
@@ -117,6 +129,14 @@ the ingest implements.
 | `index` | Existing footage → ledger, through the identical pipeline | shipped |
 | `query` | Read a ledger: `telltape query <ledger-dir> [--since T] [--until T] [--tile N] [--stream ID] [--summary]` — the tells and service events in local time, counts by hour and tile, embed spend, frozen stretches; read-only | shipped (v0.2.0) |
 | `export` | Ledger → one portable document: `telltape export <ledger-dir> [--format json\|csv] [--out FILE]` (same filters as `query`) — JSON carries every row verbatim, full fidelity, with the ledger's metadata and malformed-row count; CSV is the flat projection, one row per event in ledger order, epoch + ISO timestamps. This is how the tells travel into other tools — spreadsheets, jq pipelines, a video editor's marker import — without anyone parsing the ledger's text formats; read-only | shipped (v0.3.0) |
+
+Times in `query` (and the ISO column of a CSV `export`)
+render in your local zone: `$TZ` when set (e.g.
+`TZ=America/Anchorage`), otherwise the system zone, otherwise
+UTC. The examples in these docs were read in a set zone — on
+a machine with neither, the same tell prints in UTC and can
+carry a different calendar date than your local day. Every
+row also prints its epoch, which no zone can move.
 
 ## Documents
 
