@@ -1,21 +1,24 @@
 //! telltape CLI: `telltape watch --config <file>`,
-//! `telltape index <footage> --config <file>`, and
-//! `telltape query <ledger-dir> [filters]`.
+//! `telltape index <footage> --config <file>`,
+//! `telltape query <ledger-dir> [filters]`, and
+//! `telltape export <ledger-dir> [--format json|csv]`.
 //!
 //! `watch` runs a live source into a ledger; `index` runs
 //! existing footage (a video file, an image sequence, a still)
 //! through the identical pipeline into the same ledger format.
 //! The bare form `telltape --config <file>` is accepted as
 //! `watch`. `query` reads an existing ledger — read-only, no
-//! config — and prints its tells. The decided verb set is
-//! watch / index / query / export (naming record in
-//! BUILD-LOG.md); `export` is not in this build and is refused
-//! by name rather than ignored. `watch` and `index` print a
-//! one-line JSON summary of the run to stdout.
+//! config — and prints its tells. `export` renders the same
+//! ledger as one portable document (JSON with full row
+//! fidelity, or flat CSV) for other tools, through the same
+//! reader and filters. The verb set is watch / index / query
+//! / export (naming record in BUILD-LOG.md). `watch` and
+//! `index` print a one-line JSON summary of the run to stdout.
 
 use telltape::config::load_config;
+use telltape::export::ExportFormat;
 use telltape::query::{parse_time_bound, QueryError, QueryFilters, Zone};
-use telltape::{index, query, service};
+use telltape::{export, index, query, service};
 
 const QUERY_USAGE: &str = "usage: telltape query <ledger-dir> [--since T] [--until T] [--tile N] [--stream ID] [--summary]\n  T is an epoch (seconds, ms or µs, by magnitude) or ISO 8601 (2026-11-02, 2026-11-02T11:30:05, ...Z, ...-09:00; naive reads as local time)\n  verdicts filter on capture time; service rows on write time; bounds are inclusive";
 
@@ -91,6 +94,126 @@ fn run_query_cli(args: &[String]) -> ! {
     }
 }
 
+const EXPORT_USAGE: &str = "usage: telltape export <ledger-dir> [--format json|csv] [--out FILE] [--since T] [--until T] [--tile N] [--stream ID]\n  T is an epoch (seconds, ms or µs, by magnitude) or ISO 8601 — the same bounds, filters and time semantics as `telltape query`\n  json (default) is one document with full row fidelity; csv is the flat projection, one row per event in ledger order\n  the document goes to stdout unless --out names a file; the ledger is only ever read";
+
+/// The `export` verb: parse its own arguments (a ledger
+/// directory, not a config) and emit the document. Exit
+/// codes mirror `query`'s: 0 ok, 1 the ledger could not be
+/// read (or the --out file could not be written), 2 usage
+/// errors and bad values. Stdout carries the document and
+/// nothing else; notes go to stderr.
+fn run_export_cli(args: &[String]) -> ! {
+    let zone = Zone::local();
+    let mut filters = QueryFilters::default();
+    let mut dir: Option<String> = None;
+    let mut format = ExportFormat::Json;
+    let mut out: Option<String> = None;
+    let bound = |flag: &str, v: &str| -> u64 {
+        parse_time_bound(flag, v, &zone).unwrap_or_else(|e| {
+            eprintln!("telltape export: {e}");
+            std::process::exit(2);
+        })
+    };
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--format" | "--out" | "--since" | "--until" | "--tile" | "--stream" => {
+                let Some(v) = it.next() else {
+                    eprintln!("telltape export: {a} needs a value\n{EXPORT_USAGE}");
+                    std::process::exit(2);
+                };
+                match a.as_str() {
+                    "--format" => {
+                        format = ExportFormat::parse(v).unwrap_or_else(|| {
+                            eprintln!(
+                                "telltape export: bad --format value {v:?}: want json or csv"
+                            );
+                            std::process::exit(2);
+                        })
+                    }
+                    "--out" => out = Some(v.clone()),
+                    "--since" => filters.since_us = Some(bound("--since", v)),
+                    "--until" => filters.until_us = Some(bound("--until", v)),
+                    "--tile" => {
+                        filters.tile = Some(v.parse::<u32>().unwrap_or_else(|_| {
+                            eprintln!(
+                                "telltape export: bad --tile value {v:?}: want a tile number"
+                            );
+                            std::process::exit(2);
+                        }))
+                    }
+                    _ => filters.stream = Some(v.clone()),
+                }
+            }
+            "-h" | "--help" => {
+                eprintln!("{EXPORT_USAGE}");
+                std::process::exit(0);
+            }
+            _ if a.starts_with('-') => {
+                eprintln!("telltape export: unknown flag {a}\n{EXPORT_USAGE}");
+                std::process::exit(2);
+            }
+            _ => {
+                if dir.is_some() {
+                    eprintln!("telltape export: more than one ledger directory\n{EXPORT_USAGE}");
+                    std::process::exit(2);
+                }
+                dir = Some(a.clone());
+            }
+        }
+    }
+    let Some(dir) = dir else {
+        eprintln!("{EXPORT_USAGE}");
+        std::process::exit(2);
+    };
+    let report = match export::run_export(&dir, &filters, format) {
+        Ok(r) => r,
+        Err(e @ QueryError::BadValue { .. }) => {
+            eprintln!("telltape export: {e}");
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("telltape export: {e}");
+            std::process::exit(1);
+        }
+    };
+    // For CSV the malformed count has no metadata home in the
+    // document, so it is reported on stderr — counted, never
+    // silently dropped. (JSON carries it in its metadata.)
+    if format == ExportFormat::Csv && report.malformed > 0 {
+        let lines: Vec<String> = report
+            .malformed_lines
+            .iter()
+            .take(10)
+            .map(usize::to_string)
+            .collect();
+        eprintln!(
+            "telltape export: note: {} malformed row(s) in the ledger (lines {}) are not in the document — they do not parse, and are counted rather than dropped silently",
+            report.malformed,
+            lines.join(", ")
+        );
+    }
+    match out {
+        Some(path) => {
+            if let Err(e) = std::fs::write(&path, &report.document) {
+                eprintln!("telltape export: writing {path}: {e}");
+                std::process::exit(1);
+            }
+            eprintln!(
+                "telltape export: wrote {} tells + {} service rows ({}) to {path}",
+                report.verdicts,
+                report.service_rows,
+                format.name()
+            );
+            std::process::exit(0);
+        }
+        None => {
+            print!("{}", report.document);
+            std::process::exit(0);
+        }
+    }
+}
+
 fn print_summary(s: &service::Summary) {
     println!(
         "{{\"frames\":{},\"events\":{},\"embeds\":{},\"embeds_spent_s\":{:.3},\"embed_everything_estimate_s\":{:.3},\"verdict_latency_p50_ms\":{:.3},\"verdict_latency_max_ms\":{:.3},\"embedder_started_by_me\":{},\"embedder_stopped_by_me\":{}}}",
@@ -115,9 +238,8 @@ fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // `query` and `export` are dispatched before everything
-    // else: query takes a ledger directory, not a config, and
-    // never sees the write verbs' flags; export is refused by
-    // name (designed in the extraction plan, not built).
+    // else: they take a ledger directory, not a config, and
+    // never see the write verbs' flags.
     if let Some(first) = args.first() {
         match first.as_str() {
             "query" => {
@@ -125,10 +247,8 @@ fn main() {
                 run_query_cli(&args);
             }
             "export" => {
-                eprintln!(
-                    "telltape: `export` is a designed verb but is not built yet; `query` is the ledger reader in this build"
-                );
-                std::process::exit(2);
+                args.remove(0);
+                run_export_cli(&args);
             }
             _ => {}
         }
@@ -148,7 +268,7 @@ fn main() {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: telltape watch --config <file> [--recalibrate]\n       telltape index <footage> --config <file> [--fps N] [--recalibrate]\n       telltape query <ledger-dir> [--since T] [--until T] [--tile N] [--stream ID] [--summary]\n       (--recalibrate acknowledges an embedder swap against an existing ledger)"
+                    "usage: telltape watch --config <file> [--recalibrate]\n       telltape index <footage> --config <file> [--fps N] [--recalibrate]\n       telltape query <ledger-dir> [--since T] [--until T] [--tile N] [--stream ID] [--summary]\n       telltape export <ledger-dir> [--format json|csv] [--out FILE] [--since T] [--until T] [--tile N] [--stream ID]\n       (--recalibrate acknowledges an embedder swap against an existing ledger)"
                 );
                 std::process::exit(0);
             }

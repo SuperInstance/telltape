@@ -161,8 +161,18 @@ freshness stamps health.txt is computed from.
 
 `query` is the ledger reader (`telltape query <ledger-dir>
 [--since T] [--until T] [--tile N] [--stream ID] [--summary]`,
-read-only). The format is also plain enough to read directly
-with shelf tools:
+read-only). `export` is the same reader rendering one
+portable document for other tools (`telltape export
+<ledger-dir> [--format json|csv] [--out FILE]`, same filters,
+same time semantics): the JSON carries every row verbatim
+under the ledger's metadata (stream, grid, embedder
+identity, counts, malformed rows counted with line numbers);
+the CSV is the flat projection — one row per event in
+ledger order, a `kind` column discriminating, timestamps
+as epoch µs and ISO 8601 UTC, tile lists semicolon-joined,
+per-tile detail and stage timings only in the JSON. The
+format is also plain enough to read directly with shelf
+tools:
 
 ```sh
 jq -c 'select(.kind=="verdict") | {frame, changed_tiles}' ledger/events.jsonl

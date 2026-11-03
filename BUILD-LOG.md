@@ -551,3 +551,80 @@ back as the recorded `unknown`, both tells listed).
 **Version**: all three workspace crates 0.1.1 → 0.2.0;
 tagged v0.2.0 locally. Not pushed — publication stays the
 gated step, as before.
+
+## The export verb (2026-11-02, v0.3.0)
+
+The verb set is complete: `export` was the last
+named-not-built verb (the plan's "Optional (slice 6+)"
+surface, extraction plan §3), refused by name since v0.1.0.
+What it is: the ledger rendered as **one portable document
+for other tools** — a spreadsheet, a jq pipeline, a video
+editor's marker import — so the tells travel without anyone
+parsing the ledger's text formats. The ledger is the index;
+export is how the index travels.
+
+- **One reader, two renderers.** `export` reads through
+  query's `read_ledger` and applies query's filters with
+  query's time semantics (verdicts on capture time, service
+  rows on write time, inclusive bounds). No second parser
+  exists to drift. To make that possible the shared reader
+  grew two honest limbs, both additive: parsed rows now
+  retain their **original line verbatim**, and the ledger
+  data keeps an **ordered row list** (the split verdict /
+  service vectors lose the interleave, and CSV is written
+  in ledger order).
+- **JSON = full fidelity by construction.** Each row is
+  embedded verbatim — the exact line the ledger holds — so
+  "every field, field-for-field" is a property of the
+  reader, not of a re-serialisation. Metadata wraps it:
+  stream, grid, embedder identity, the filters in force,
+  exported vs in-ledger counts, and the malformed-row count
+  **with line numbers**. A legacy ledger exports
+  `embedder_identity: null` with `legacy_ledger: true` —
+  the unknown marker intact, never an invented value; a
+  recorded `unknown` exports as itself.
+- **CSV = the flat projection.** One row per event, both
+  kinds in one table in ledger order, a `kind` column
+  discriminating; scalar fields only (tile lists
+  semicolon-joined; per-tile detail and stage timings live
+  only in the JSON). Timestamps as epoch µs **and** ISO
+  8601 UTC (fraction trimmed of trailing zeros). Float
+  fields ride at their written precision — the exporter
+  reads the raw token, never re-renders a parsed float.
+  RFC 4180 quoting for fields carrying commas, quotes, or
+  newlines. The header is a pinned format surface, held by
+  a test's literal string.
+- **The honesty rules are query's, inherited.** Read-only
+  (the byte-snapshot proof now runs around both formats);
+  malformed rows counted — in the JSON metadata, and on
+  stderr for CSV, whose document has no metadata home;
+  typed errors and exit codes mirror query's (1 read
+  failure, 2 usage). `--out` writes the file and says so
+  on stderr; stdout stays a pure document.
+- **Fixtures are shared, literally.** The query tests'
+  fixture ledgers moved to `tests/common/` and both verbs'
+  suites build on them; a parity test runs eight filter
+  sets through `query` and `export` (both formats) and
+  demands identical selection. The query suite's
+  export-refusal test retired — the refusal it pinned is
+  the thing this slice removes.
+
+**Tests**: 116 → 130 passed (+1 pre-existing ignore);
+clippy `--all-targets -D warnings` clean; `cargo fmt`
+clean. New: 3 unit (escaping, CSV quoting, format names),
+11 integration (verbatim fidelity — every filtered source
+line exactly once in the document; filter parity with
+query; the pinned CSV header and the frame-205 row's cells
+including ISO forms; comma-quoting round-trip; read-only
+proof; legacy identity; malformed counting in both
+formats; typed errors; the binary's stdout purity, --out
+behaviour, exit codes, and CSV stderr note), 1 unit in
+query (ISO anchors). Staged acceptance untouched and
+re-run cold: 18 frames, 34 embeds, 2 events, frame 4 the
+cut, frame 7 = exactly {5,6}, drift silent — and export
+run against that acceptance ledger in both formats as a
+final live check.
+
+**Version**: all three workspace crates 0.2.0 → 0.3.0;
+tagged v0.3.0 locally. Not pushed — publication stays the
+gated step, as before.

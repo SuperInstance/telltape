@@ -116,7 +116,7 @@ the ingest implements.
 | `watch` | Live source → ledger | shipped |
 | `index` | Existing footage → ledger, through the identical pipeline | shipped |
 | `query` | Read a ledger: `telltape query <ledger-dir> [--since T] [--until T] [--tile N] [--stream ID] [--summary]` — the tells and service events in local time, counts by hour and tile, embed spend, frozen stretches; read-only | shipped (v0.2.0) |
-| `export` | Ledger → CSV / ffmpeg chapters | designed in the extraction plan, **not built** |
+| `export` | Ledger → one portable document: `telltape export <ledger-dir> [--format json\|csv] [--out FILE]` (same filters as `query`) — JSON carries every row verbatim, full fidelity, with the ledger's metadata and malformed-row count; CSV is the flat projection, one row per event in ledger order, epoch + ISO timestamps. This is how the tells travel into other tools — spreadsheets, jq pipelines, a video editor's marker import — without anyone parsing the ledger's text formats; read-only | shipped (v0.3.0) |
 
 ## Documents
 

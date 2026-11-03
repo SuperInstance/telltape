@@ -456,6 +456,25 @@ fn fmt_local(epoch_us: u64, zone: &Zone) -> String {
     )
 }
 
+/// ISO 8601 in UTC: `2026-11-02T20:44:48Z`, with a fractional
+/// part (trailing zeros trimmed) when the instant is not on a
+/// whole second. The portable timestamp for exports — no zone
+/// abbreviation to misread, no local offset to lose.
+pub fn fmt_iso_us(epoch_us: u64) -> String {
+    let t = local_time(epoch_us, &Zone::utc());
+    let base = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        t.y, t.mo, t.d, t.h, t.mi, t.s
+    );
+    let frac = epoch_us % 1_000_000;
+    if frac == 0 {
+        format!("{base}Z")
+    } else {
+        let digits = format!("{frac:06}");
+        format!("{}.{}Z", base, digits.trim_end_matches('0'))
+    }
+}
+
 /// `12h 57m` / `3m 12s` / `45s` / `2d 3h`.
 fn fmt_duration(secs: u64) -> String {
     if secs >= 86_400 {
@@ -636,6 +655,23 @@ fn find_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     Some(rest[colon + 1..].trim_start())
 }
 
+/// The raw token text for a key, unparsed — for the float
+/// fields (`verdict_latency_ms`, `energy_before`, …), whose
+/// written precision is part of the record and must survive
+/// an export byte-for-byte rather than be re-rendered.
+pub(crate) fn json_token(line: &str, key: &str) -> Option<String> {
+    let rest = find_key(line, key)?;
+    let end = rest
+        .find(|c: char| c == ',' || c == '}' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let tok = &rest[..end];
+    if tok.is_empty() {
+        None
+    } else {
+        Some(tok.to_string())
+    }
+}
+
 fn json_str(line: &str, key: &str) -> Option<String> {
     let rest = find_key(line, key)?;
     let rest = rest.strip_prefix('"')?;
@@ -643,7 +679,7 @@ fn json_str(line: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-fn json_u64(line: &str, key: &str) -> Option<u64> {
+pub(crate) fn json_u64(line: &str, key: &str) -> Option<u64> {
     let rest = find_key(line, key)?;
     let end = rest
         .find(|c: char| c == ',' || c == '}' || c.is_whitespace())
@@ -651,7 +687,7 @@ fn json_u64(line: &str, key: &str) -> Option<u64> {
     rest[..end].parse::<u64>().ok()
 }
 
-fn json_tiles(line: &str, key: &str) -> Option<Vec<u32>> {
+pub(crate) fn json_tiles(line: &str, key: &str) -> Option<Vec<u32>> {
     let rest = find_key(line, key)?;
     let rest = rest.strip_prefix('[')?;
     let end = rest.find(']')?;
@@ -666,27 +702,34 @@ fn json_tiles(line: &str, key: &str) -> Option<Vec<u32>> {
 }
 
 #[derive(Debug, Clone)]
-struct VerdictRow {
-    stream: String,
-    frame: u32,
+pub(crate) struct VerdictRow {
+    pub(crate) stream: String,
+    pub(crate) frame: u32,
     // wall_us is parsed and required (a verdict without it is
-    // malformed) but deliberately not kept: query filters and
-    // displays verdicts on capture time, and keeping a second
-    // clock in the row invites mixing them.
-    t_capture_us: u64,
-    changed_tiles: Vec<u32>,
-    embeds_this_frame: u64,
+    // malformed) but deliberately not kept as a field: query
+    // filters and displays verdicts on capture time, and
+    // keeping a second clock in the row invites mixing them.
+    // It survives in `raw`, where export reads it.
+    pub(crate) t_capture_us: u64,
+    pub(crate) changed_tiles: Vec<u32>,
+    pub(crate) embeds_this_frame: u64,
+    /// The row's original line, verbatim. Export embeds it
+    /// whole — full fidelity is then a property of the reader,
+    /// not a second serialisation that could drift.
+    pub(crate) raw: String,
 }
 
 #[derive(Debug, Clone)]
-struct ServiceRow {
-    event: String,
-    msg: String,
-    wall_us: u64,
+pub(crate) struct ServiceRow {
+    pub(crate) event: String,
+    pub(crate) msg: String,
+    pub(crate) wall_us: u64,
+    /// The row's original line, verbatim (see VerdictRow).
+    pub(crate) raw: String,
 }
 
 #[derive(Debug, Clone)]
-enum Row {
+pub(crate) enum Row {
     Verdict(VerdictRow),
     Service(ServiceRow),
 }
@@ -704,12 +747,14 @@ fn parse_row(line: &str) -> Option<Row> {
                 t_capture_us: json_u64(line, "t_capture_us")?,
                 changed_tiles: json_tiles(line, "changed_tiles")?,
                 embeds_this_frame: json_u64(line, "embeds_this_frame")?,
+                raw: line.to_string(),
             }))
         }
         "service" => Some(Row::Service(ServiceRow {
             event: json_str(line, "event")?,
             msg: json_str(line, "msg").unwrap_or_default(),
             wall_us: json_u64(line, "wall_us")?,
+            raw: line.to_string(),
         })),
         _ => None,
     }
@@ -718,19 +763,23 @@ fn parse_row(line: &str) -> Option<Row> {
 // ----------------------------------------------------------------
 // The ledger on disk (read-only)
 
-struct LedgerData {
-    stream: Option<String>,
-    grid: Option<Grid>,
+pub(crate) struct LedgerData {
+    pub(crate) stream: Option<String>,
+    pub(crate) grid: Option<Grid>,
     /// Verbatim identity from the lens, when recorded.
-    identity: Option<String>,
+    pub(crate) identity: Option<String>,
     /// A lens exists but records no identity: a pre-0.1.1 ledger.
-    legacy: bool,
-    verdicts: Vec<VerdictRow>,
-    service: Vec<ServiceRow>,
+    pub(crate) legacy: bool,
+    pub(crate) verdicts: Vec<VerdictRow>,
+    pub(crate) service: Vec<ServiceRow>,
+    /// Every parsed row, in ledger (file) order — the split
+    /// vectors above lose the interleave, and export's single
+    /// CSV table is written in ledger order.
+    pub(crate) ordered: Vec<Row>,
     /// 1-based line numbers of rows that did not parse.
-    malformed: Vec<usize>,
+    pub(crate) malformed: Vec<usize>,
     /// Raw key = value pairs from state.txt, when present.
-    state: Option<Vec<(String, String)>>,
+    pub(crate) state: Option<Vec<(String, String)>>,
 }
 
 fn read_kv(text: &str) -> Vec<(String, String)> {
@@ -746,7 +795,7 @@ fn kv_get<'a>(kv: &'a [(String, String)], key: &str) -> Option<&'a str> {
     kv.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
 
-fn read_ledger(dir: &str) -> Result<LedgerData, QueryError> {
+pub(crate) fn read_ledger(dir: &str) -> Result<LedgerData, QueryError> {
     let root = Path::new(dir);
     let meta = std::fs::metadata(root).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -815,6 +864,7 @@ fn read_ledger(dir: &str) -> Result<LedgerData, QueryError> {
         .map(|t| read_kv(&t));
     let mut verdicts = Vec::new();
     let mut service = Vec::new();
+    let mut ordered = Vec::new();
     let mut malformed = Vec::new();
     for (i, line) in events_text.lines().enumerate() {
         let line = line.trim();
@@ -826,9 +876,13 @@ fn read_ledger(dir: &str) -> Result<LedgerData, QueryError> {
                 if stream.is_none() {
                     stream = Some(v.stream.clone());
                 }
+                ordered.push(Row::Verdict(v.clone()));
                 verdicts.push(v);
             }
-            Some(Row::Service(s)) => service.push(s),
+            Some(Row::Service(s)) => {
+                ordered.push(Row::Service(s.clone()));
+                service.push(s);
+            }
             None => malformed.push(i + 1),
         }
     }
@@ -839,6 +893,7 @@ fn read_ledger(dir: &str) -> Result<LedgerData, QueryError> {
         legacy,
         verdicts,
         service,
+        ordered,
         malformed,
         state,
     })
@@ -847,7 +902,7 @@ fn read_ledger(dir: &str) -> Result<LedgerData, QueryError> {
 // ----------------------------------------------------------------
 // Filtering
 
-fn verdict_passes(v: &VerdictRow, f: &QueryFilters) -> bool {
+pub(crate) fn verdict_passes(v: &VerdictRow, f: &QueryFilters) -> bool {
     if let Some(t) = f.tile {
         if !v.changed_tiles.contains(&t) {
             return false;
@@ -871,7 +926,11 @@ fn verdict_passes(v: &VerdictRow, f: &QueryFilters) -> bool {
     true
 }
 
-fn service_passes(s: &ServiceRow, f: &QueryFilters, ledger_stream: &Option<String>) -> bool {
+pub(crate) fn service_passes(
+    s: &ServiceRow,
+    f: &QueryFilters,
+    ledger_stream: &Option<String>,
+) -> bool {
     // Service rows carry no tiles and no stream field: a tile
     // filter cannot match them, and a stream filter matches
     // only when it names the ledger's own stream.
@@ -900,7 +959,7 @@ fn service_passes(s: &ServiceRow, f: &QueryFilters, ledger_stream: &Option<Strin
 // ----------------------------------------------------------------
 // Rendering
 
-fn identity_display(data: &LedgerData) -> String {
+pub(crate) fn identity_display(data: &LedgerData) -> String {
     match &data.identity {
         Some(id) if id == "unknown" => "unknown (recorded: no embedder was declared)".to_string(),
         Some(id) => id.clone(),
@@ -1290,6 +1349,17 @@ mod tests {
             assert_eq!(civil_from_days(days), (y, m, d), "{y}-{m}-{d}");
         }
         assert_eq!(days_from_civil(2026, 1, 1) * 86_400, 1_767_225_600);
+    }
+
+    #[test]
+    fn iso_format_is_utc_with_trimmed_fraction() {
+        assert_eq!(fmt_iso_us(1_793_652_288_000_000), "2026-11-02T20:44:48Z");
+        assert_eq!(
+            fmt_iso_us(1_793_652_288_012_500),
+            "2026-11-02T20:44:48.0125Z"
+        );
+        assert_eq!(fmt_iso_us(0), "1970-01-01T00:00:00Z");
+        assert_eq!(fmt_iso_us(1), "1970-01-01T00:00:00.000001Z");
     }
 
     #[test]
