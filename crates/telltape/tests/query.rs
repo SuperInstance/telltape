@@ -465,3 +465,115 @@ fn binary_query_uses_the_local_zone() {
     assert_eq!(code, 0, "{stdout}");
     assert!(stdout.contains("2026-11-02 11:44:48 AKST"), "{stdout}");
 }
+
+/// Playtest-2 S3: a normally completed run — start, verdicts,
+/// stop, end of ledger — has NO stopped stretch. `stop` is the
+/// final event a run writes; pairing stops and starts within
+/// the filtered rows alone (v0.3.1) reported that terminal
+/// stop as a stretch "still open at the last row in the
+/// filter", with an orphan note about the run's own opening
+/// start, for every completed run ever queried.
+#[test]
+fn a_completed_run_reports_no_stopped_stretch() {
+    use std::io::Write as _;
+    let dir = tempdir("completed-run");
+    std::fs::write(
+        format!("{dir}/lens.txt"),
+        "stream_id = shop\ngrid = 4x4\nembedder_identity = test@1\nthreshold = 0.2500\nalpha = 0.1000\nframes_observed = 10\n",
+    )
+    .unwrap();
+    let rows = [
+        service_row("start", "stream shop starting", 1_793_649_590_000_000),
+        verdict_row("shop", 5, 1_793_649_700_000_000, &[5, 6], 6),
+        service_row(
+            "stop",
+            "frames=10 events=1 embeds=30",
+            1_793_649_900_000_000,
+        ),
+    ];
+    let mut f = std::fs::File::create(format!("{dir}/events.jsonl")).unwrap();
+    for r in rows {
+        writeln!(f, "{r}").unwrap();
+    }
+    drop(f);
+    let report = run_query(
+        &dir,
+        &QueryFilters {
+            summary: true,
+            ..Default::default()
+        },
+        &akst(),
+    )
+    .unwrap();
+    let t = &report.text;
+    let stopped_at = t
+        .find("service-stopped stretches")
+        .expect("section present");
+    let section = &t[stopped_at..];
+    assert!(
+        section.contains("(none under these filters)"),
+        "a completed run has no stopped stretch: {t}"
+    );
+    assert!(
+        !t.contains("still open at the last row in the filter"),
+        "no phantom open stretch: {t}"
+    );
+    assert!(
+        !t.contains("closing row(s) with no opening row in view"),
+        "no orphan note for the run's own opening start: {t}"
+    );
+}
+
+/// S3, the filter-side truths the fix must preserve: when a
+/// filter clips fixture A's closing start (13:15) out of view,
+/// the stretch IS "still open at the last row in the filter" —
+/// a statement about the filter, kept verbatim; and when the
+/// filter starts after the stop, the closing start is an
+/// orphan and no stretch renders.
+#[test]
+fn stopped_stretch_projection_stays_true_of_the_filter() {
+    let dir = fixture_a("stopped-projection");
+    // Until 13:10 AKST: the 13:00 stop is in view, the 13:15
+    // start that closes it is not.
+    let clipped = run_query(
+        &dir,
+        &QueryFilters {
+            summary: true,
+            until_us: Some(1_793_657_000_000_000),
+            ..Default::default()
+        },
+        &akst(),
+    )
+    .unwrap();
+    assert!(
+        clipped
+            .text
+            .contains("2026-11-02 13:00:00 AKST -> still open at the last row in the filter"),
+        "{}",
+        clipped.text
+    );
+    // Since 13:10 AKST: only the closing start (and the last
+    // verdict) are in view — the start is an orphan.
+    let orphaned = run_query(
+        &dir,
+        &QueryFilters {
+            summary: true,
+            since_us: Some(1_793_657_000_000_000),
+            ..Default::default()
+        },
+        &akst(),
+    )
+    .unwrap();
+    assert!(
+        orphaned
+            .text
+            .contains("1 closing row(s) with no opening row in view"),
+        "{}",
+        orphaned.text
+    );
+    assert!(
+        !orphaned.text.contains("(15m 0s)"),
+        "the stretch itself is outside the filter: {}",
+        orphaned.text
+    );
+}

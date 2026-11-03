@@ -151,6 +151,9 @@ row also prints its epoch, which no zone can move.
 - [docs/BRING-YOUR-OWN-EMBEDDER.md](docs/BRING-YOUR-OWN-EMBEDDER.md)
   — the embedder seam contract and how to plug in I-JEPA or
   any other model under your own terms.
+- [docs/CONFIG.md](docs/CONFIG.md) — every config key and
+  its default: the run, the embedder, the decision, footage
+  indexing.
 - [BUILD-LOG.md](BUILD-LOG.md) — how this extraction was
   built: decisions, dead ends, numbers, in the body of the work.
 

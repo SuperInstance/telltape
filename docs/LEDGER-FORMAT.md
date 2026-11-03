@@ -22,7 +22,7 @@ change (silence is the default state of the file):
 | `frame` | u32 | frame number in the source's own sequence — the seek key into file footage |
 | `wall_us` | u64 | ledger-write time, epoch µs |
 | `t_capture_us` | u64 | frame capture time, epoch µs — the seek key into timestamped footage. For `index`, the footage's own timeline, anchored as the lens's `time_anchor` records (see lens.txt) |
-| `verdict_latency_ms` | f64, 3 dp | capture → ledger write, including that frame's embed time. For `watch` that is detection latency; for `index` the capture times are the footage's own timeline, so the same number measures *processing lag behind the footage timeline* — the run summary says which, in its `verdict_latency_basis` field. The ledger field keeps its name in both worlds (format compatibility); the label lives at presentation |
+| `verdict_latency_ms` | f64, 3 dp | capture → ledger write, including that frame's embed time. For `watch` that is detection latency; for `index` the capture times are the footage's own timeline, so the same number measures *processing lag behind the footage timeline* — the run summary says which, in its `verdict_latency_basis` field, and **the export carries the basis with the numbers**: the JSON metadata has a `verdict_latency_basis` field, and a CSV export states the basis on stderr (the CSV header is a pinned format and cannot grow it). The ledger field keeps its name in both worlds (format compatibility); the label lives at presentation (playtest-2 S5: a bare CSV column of footage lags reads as verdict computation time) |
 | `changed_tiles` | [u32] | tiles published changed, row-major over the ledger's grid (in `lens.txt`) |
 | `focus` | [u32] | the director's top-`focus_k` tiles by raw score — the attention record; it does not gate compute |
 | `lineage_mask` | u64 | bitmask of cascade stages that touched the verdict (bits 0–4: perceive, decide, direct, refine, publish; a full pass = 31) |
@@ -36,12 +36,32 @@ change (silence is the default state of the file):
 include `start`, `stop`, `embedder`, `embedder_start`,
 `embedder_stop`, the freshness receipts `source_frozen` /
 `source_recovered` (see health.txt), `embedder_swap`
-(see "Embedder identity and the swap rule" below), and
-`degenerate_embedder` — the receipt of a stopped run: an
-embedding that cannot carry a score (zero norm, non-finite)
-was refused at a named frame and tile, and the run ended
-there rather than author tells from it (playtest F1; the
-run's error is the typed `DegenerateEmbedding` refusal).
+(see "Embedder identity and the swap rule" below), and the
+failure receipts — a run's failure is part of its record,
+receipted before the run's error returns:
+
+- `degenerate_embedder` — an embedding that cannot carry a
+  score (zero norm, non-finite) was refused at a named frame
+  and tile, and the run ended there rather than author tells
+  from it (playtest F1; the run's error is the typed
+  `DegenerateEmbedding` refusal).
+- `collapsed_embedder` — the run-time variance watch
+  convicted the embedder (playtest-2 B1): tiles whose pixels
+  changed materially kept producing embeddings that did not
+  move, and no varied input ever moved one. The receipt
+  carries the counts; the run's error is the typed
+  `EmbedderCollapsed` refusal; health stamps the embedder
+  `collapsed`. The tripping frame publishes nothing.
+- `embedder_error` — an embedder call failed mid-run and the
+  ingest classified it before exiting: the message names the
+  class, `(transport)` for a failed call (HTTP 500, dropped
+  connection) or `(response)` for an unreadable answer.
+  The run is aborted from that point (playtest-2 S4).
+- `run_aborted` — the run ended in failure without a more
+  specific receipt above: an ingest that died unclassified,
+  a record stream that failed to read, a pipeline refusal.
+  Closed runs carry `run_outcome = aborted` in state.txt,
+  and health never stamps their silence meaningful.
 
 ## Embedder identity and the swap rule
 
@@ -119,12 +139,24 @@ score EMAs, `null` = never scored).
 
 `stream_id`, `frames_seen`, `frames_novel`, `frames_repeated`,
 `freshness`, `frames_changed`, `events_published`,
-`last_frame`, `tiles_nominated`, `tiles_embedded`, `coverage`
+`max_smoothed_score` (the strongest smoothed score any tile
+reached this run, published or not — playtest-2 S2: before
+it, a near-miss left no row anywhere, so the scores
+calibration most needs were unobservable), `near_miss_frames`
+(frames that published nothing whose best tile score reached
+≥ 80% of the threshold — the near-miss band the calibration
+loop in BRING-YOUR-OWN-EMBEDDER.md reads), `last_frame`,
+`tiles_nominated`, `tiles_embedded`, `coverage`
 (embedded ÷ nominated), `embeds_spent_s`,
 `embed_everything_estimate_s` (what ungated watching would
 have cost at the observed embed latency and this grid),
-`spend_ratio`, `embedder` (`up`/`down`), `embedder_identity`,
+`spend_ratio`, `embedder` (`up`/`down`/`collapsed` — see
+health.txt), `embedder_identity`,
 `embedder_started_by_me`, `soak`, `updated_wall_us`.
+A run that ended in a receipted failure (a degenerate or
+collapsed embedder, an embedder transport failure, a dead
+ingest) additionally carries `run_outcome = aborted`;
+completed runs carry no such line.
 
 In soak mode (`soak = true`) state.txt additionally carries,
 verbatim:
@@ -150,9 +182,19 @@ what makes quiet meaningful — or says it isn't:
 - `frames_pending_max` — deepest ingest backlog observed.
 - `last_frame_age_ms` — wall time since the last frame was
   recorded (−1.0 before any frame).
-- `embedder` — `up` / `down`.
+- `embedder` — `up` / `down` / `collapsed`. `collapsed` is
+  the variance watch's verdict (playtest-2 B1): the embedder
+  answers, promptly and at the right width, but its answers
+  do not discriminate this run's inputs. It is neither up
+  (it must not vouch for silence) nor down (it is not a
+  liveness failure). A run that never processed a frame —
+  a probe refusal, a dead ingest — reports `down`, never
+  `up`: it never proved its embedder for this run (W3).
 - `embedder_identity` — the embedder that produced this
   ledger's tells (see "Embedder identity and the swap rule").
+- `max_smoothed_score` / `near_miss_frames` — the run's
+  score ceiling and near-miss count, as in state.txt
+  (calibration observability, playtest-2 S2).
 - **`freshness`** — `live` / `frozen` / `unknown` / `footage`.
   Freshness is proven by *image novelty*: the ingest hashes
   each frame, and a frame identical to its predecessor is a
@@ -169,13 +211,22 @@ what makes quiet meaningful — or says it isn't:
   `freshness = frozen` — the playtest's category error, F3.
 - `frames_novel` / `frames_repeated` / `consecutive_repeats` —
   the novelty counters behind the state.
-- **`silence_meaningful`** — true only when the embedder is
-  up, frames have been seen, **and the source is not frozen**.
-  This line is the difference between "nothing happened" and
-  "we don't know." (Its frozen clause is gap G1's fix: in the
-  2026-11 soak a dead camera was polled for ~13 h while this
-  line read true; the regression test is
-  `frozen_source_reads_frozen_not_meaningful_silence`.)
+- **`silence_meaningful`** — true only when **all** of: the
+  embedder is up, it has not collapsed, the run has not
+  aborted, frames have been seen, and the source is not
+  frozen. This line is the difference between "nothing
+  happened" and "we don't know." Each clause is a failure
+  that once wore the stamp: the frozen clause is gap G1's
+  fix (in the 2026-11 soak a dead camera was polled for
+  ~13 h while this line read true; the regression test is
+  `frozen_source_reads_frozen_not_meaningful_silence`); the
+  collapse clause is playtest-2 B1 (a constant embedder's
+  run completed in stamped silence over a changing scene;
+  the invariant now is that silence is stamped only when
+  the embedder has demonstrated discrimination on this
+  run's actual inputs); the abort clause is playtest-2 S4
+  (a transport failure left health claiming `up` and
+  meaningful over an unreceipted, unclosed run).
 
 ## The record stream (ingest → service)
 
@@ -188,6 +239,12 @@ meets: the ingest writes one JSON record per embedded tile —
 codec is `harbor_watch::record`; `frame_hash`/`frame_repeat`
 are the freshness stamps health.txt is computed from, and
 `time_anchor` is the anchor stamp the lens records (above).
+One further control line exists since v0.3.2:
+`{"control":"ingest_error","class","msg"}`, emitted once,
+on the way out, when an embedder call fails mid-run
+(playtest-2 S4) — `class` is `transport` or `response`, and
+the service receipts it as the `embedder_error` service row
+above before the stream ends.
 
 ## Reading a ledger with shelf tools
 
@@ -198,7 +255,9 @@ portable document for other tools (`telltape export
 <ledger-dir> [--format json|csv] [--out FILE]`, same filters,
 same time semantics): the JSON carries every row verbatim
 under the ledger's metadata (stream, grid, embedder
-identity, counts, malformed rows counted with line numbers);
+identity, the `verdict_latency_basis`, counts, malformed
+rows counted with line numbers — for CSV the basis is
+stated on stderr instead);
 the CSV is the flat projection — one row per event in
 ledger order, a `kind` column discriminating, timestamps
 as epoch µs and ISO 8601 UTC, tile lists semicolon-joined,

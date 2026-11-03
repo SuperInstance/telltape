@@ -77,6 +77,28 @@ pub struct ExportReport {
     /// cannot apply to rows that do not parse).
     pub malformed: usize,
     pub malformed_lines: Vec<usize>,
+    /// The basis every `verdict_latency_ms` value in the
+    /// document is measured on (playtest-2 S5) — carried in
+    /// the JSON metadata, and reported on stderr for CSV,
+    /// whose header is a pinned format and cannot grow the
+    /// column's unit.
+    pub verdict_latency_basis: &'static str,
+}
+
+/// The basis of a ledger's `verdict_latency_ms` values, in
+/// the watch summary's own vocabulary (playtest-2 S5): on a
+/// live source the number is capture-to-ledger-write delay;
+/// on recorded footage it is processing lag behind the
+/// footage's own timeline — a batch job's 147,566 ms says
+/// "the processor was 2.5 minutes behind the footage", not
+/// "a verdict took 2.5 minutes". A bare CSV column of these
+/// numbers, basis unstated, reads as the wrong one of those.
+pub fn verdict_latency_basis(footage: bool) -> &'static str {
+    if footage {
+        "processing_lag_behind_footage_timeline"
+    } else {
+        "capture_to_ledger_write"
+    }
 }
 
 /// Escape a string for JSON output — the metadata values
@@ -139,6 +161,11 @@ fn render_json(
         json_opt_str(&data.identity)
     ));
     t.push_str(&format!("  \"legacy_ledger\": {},\n", data.legacy));
+    // S5: the latency column's basis travels with the numbers.
+    t.push_str(&format!(
+        "  \"verdict_latency_basis\": \"{}\",\n",
+        verdict_latency_basis(data.footage)
+    ));
     t.push_str("  \"filters\": {\n");
     t.push_str(&format!(
         "    \"since_us\": {},\n",
@@ -354,6 +381,7 @@ pub fn run_export(
         service_rows,
         malformed: data.malformed.len(),
         malformed_lines: data.malformed.clone(),
+        verdict_latency_basis: verdict_latency_basis(data.footage),
     })
 }
 

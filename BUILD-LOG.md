@@ -756,3 +756,203 @@ under a seam that would have caught the playtest's server.
 **Version**: all three workspace crates 0.3.0 → 0.3.1;
 tagged v0.3.1 locally. Not pushed — publication stays the
 gated step, as before.
+
+## The second cold playtest fixes (2026-11-03, v0.3.2)
+
+v0.3.1 was playtested the same way: a zero-shot agent, only
+the public repo, a job, instructions to be uncharitable and
+fix nothing. Its report (`~/workspace/cold-playtest-2/
+PLAYTEST-REPORT.md`, artefacts kept beside it — including
+the collapsed-embedder server and the ledgers it produced)
+is the source of every item below. It again found the hole
+the hired hands had walked past, and the hole was worse
+than F1: F1's embedder was *broken*; this one's was
+*plausible*.
+
+- **B1 (blocker) — a collapsed embedder authored a quiet,
+  wrong ledger, and the silence was stamped meaningful.**
+  The playtest's constant server returns one valid vector —
+  finite, right width, unit norm — for every tile. It passed
+  the startup probe (which checked width and degeneracy; a
+  constant vector is neither wrong-width nor degenerate) and
+  every per-call check, completed the run with 0 events and
+  exit 0, and health stamped `silence_meaningful = true`
+  over footage containing an appearing object and a full
+  scene change. Every score was 0 because every comparison
+  was a vector against itself.
+  The invariant this release implements, stated once:
+  **silence may only be stamped meaningful when the
+  embedder has demonstrated discrimination on this run's
+  actual inputs.** Two demonstrations are now required:
+  - *At the probe* (ingest): the embedder must embed two
+    synthetic tiles — pure black and pure white, the most
+    different inputs a tile can be — at cosine distance
+    > 0.01. The epsilon's justification: decision thresholds
+    in the record live between 0.05 and 0.30; float32
+    near-identical vectors (the playtest's jitter artefact)
+    sit at ~1e-6; 0.01 is four orders of magnitude above
+    noise and five times below the weakest real geometry in
+    the record. Anything that cannot separate black from
+    white by more than that will not separate a door opening
+    either. The refusal names the collapse and prints the
+    measured distance.
+  - *At the seam* (service): a variance watch
+    (`CollapseWatch`) tracks, per run, the relationship
+    between input variation and embedding variation. A tile
+    observation counts when its gate diff reaches 10.0
+    (material change — 3× the nomination gate; staged cuts
+    measure ~64, the drift the gate ignores ~1.2) — and
+    convicts when its score stays ≤ 0.005 (identical vectors
+    score exactly 0; jitter ≲1e-3; the weakest honest
+    geometry in the record scored every real change ≥0.02).
+    Twelve varied-but-unmoved observations with **no**
+    varied input ever moving an embedding trips it. One
+    moved varied observation demonstrates the embedder for
+    the whole run, permanently: collapse means *never*
+    answering, not answering rarely.
+  - **Design call — the run stops.** The alternative was a
+    degraded mode: keep recording, stamp every frame
+    "untrusted". Rejected, and the reasoning is the F1
+    precedent plus one step: the degenerate path already
+    established that a broken embedder stops the watch
+    rather than authoring under a false premise, and a
+    degraded ledger has the worse property that its frames
+    cannot be told apart downstream — query and export
+    consumers would have to honour a stamp the format has
+    no other example of, and the frames already written
+    before the trip wear the stamp of the frames before
+    them. A typed stop with a receipt (`collapsed_embedder`,
+    counts included) is a fact a reader can act on; a
+    degraded continuation is a mood. The tripping frame
+    itself is not recorded, on the same precedent as
+    degeneracy: the frame that proves the embedder broken
+    does not get to author state.
+  - A uniformly blank scene cannot trip it. The trigger is
+    input variation *without* embedding variation — a
+    blank wall produces no varied observations at all,
+    however constant its embeddings are. The regression
+    battery holds all three fixtures: the constant server
+    (probe refusal), a near-constant jitter server (probe
+    refusal — the check compares distance, not bit-equality),
+    a "smart collapse" server that genuinely discriminates
+    the probe's extremes and collapses only on real tiles
+    (the watch's conviction, `embedder = collapsed` in
+    health), and the honest blank-wall run, untouched and
+    still meaningful.
+- **S3 — `query --summary` invented a service outage for
+  every completed run.** Pairing `stop` → `start` within
+  the filtered rows made the terminal stop of a normal run
+  an open stretch "still open at the last row in the
+  filter", plus an orphan note about the run's own opening
+  start. The rule now, from the ledger's own semantics:
+  `stop` is the final event a run writes, so a stop no
+  later start answers is a run *ending*, not a stretch.
+  Pairing happens over the full service record; the result
+  is then projected onto the filtered view, where the old
+  vocabulary stays true of the filter (a stretch whose
+  closing start the filter clips away *is* "still open at
+  the last row in the filter"; a closing start whose
+  opening stop is filtered out *is* an orphan). A completed
+  run shows no stretch and no note.
+- **S4 — a mid-run transport failure left no trace but a
+  traceback.** HTTP 500 at frame 4 of the playtest's run:
+  the user's console got the raw `requests` stack, the
+  ledger got *no closing receipt at all* (events.jsonl held
+  only its `start` row), and health kept claiming
+  `embedder = up`, `silence_meaningful = true`. The
+  degenerate path was the model — the playtest called its
+  receipting exemplary — and the fix gives every abort the
+  same treatment:
+  - The ingest classifies embedder-call failures at the
+    call site — `transport` (the call failed: 500, dropped
+    connection) vs `response` (the answer could not be
+    read: bad JSON, missing key, wrong width) — and emits
+    one `ingest_error` control line before exiting, plus
+    one clean line on stderr. No traceback reaches the user
+    from the frame loop; other mid-run failures also exit
+    on one line.
+  - The service receipts the control line on arrival as an
+    `embedder_error` service event naming the class, marks
+    the run aborted, and the error it returns carries the
+    class too. Unclassified deaths (a stream that fails to
+    read, an ingest that exits badly with no account of
+    itself) get the generic `run_aborted` receipt.
+  - Health is now part of the receipt: a run marked aborted
+    never stamps silence meaningful, and state.txt carries
+    `run_outcome = aborted`.
+- **S1 — the contract doc omitted the health requirement,
+  and its sketch couldn't have satisfied the contract.**
+  The service derives `{origin}/health` from `embed_url`
+  and requires a 200 there before a run starts; the BYO doc
+  never mentioned it (the playtester found it in source),
+  and the doc's sketch server had no GET handler and waved
+  at multipart parsing in a comment. The doc now states
+  the health requirement in the contract (with the
+  `embed_health_url` override), and the sketch implements
+  both: `do_GET` for `/health`, and a correct stdlib
+  multipart field parser. Also new: **docs/CONFIG.md** —
+  the config reference the playtest found missing entirely
+  (the decision threshold was discoverable only in
+  `config.rs`): every key, its default, and what it does,
+  aliases included, linked from the README.
+- **S2 — calibration was impossible from the record.**
+  Threshold 0.25 is calibrated to I-JEPA's geometry; the
+  playtest's luminance embedder scored a full scene change
+  at 0.02–0.16, deaf at that threshold — and no fix was
+  discoverable, because unpublished frames left no rows:
+  the scores calibration most needs existed nowhere in the
+  ledger. state.txt and health.txt now carry
+  `max_smoothed_score` (the run's strongest tile score,
+  published or not) and `near_miss_frames` (silent frames
+  whose best score reached ≥ 80% of threshold), and the
+  BYO doc's calibration section is rewritten as a loop run
+  off those two numbers.
+- **S5 + the wart list.**
+  - S5: export latency numbers now travel with their
+    basis. The playtest's CSV showed 147,566 ms for a 2 s
+    stills job — processing lag behind the footage
+    timeline, readable only as verdict computation time.
+    The JSON export's metadata gains
+    `verdict_latency_basis` (the watch summary's own
+    vocabulary); CSV, whose header is a pinned format,
+    states the basis on stderr — stdout stays byte-pure.
+  - W1: the ingest's BrokenPipeError traceback on shutdown
+    is gone — SIGPIPE restored to the Unix default, the
+    error caught as a clean exit besides. It used to land
+    on exactly the degraded runs a user inspects.
+  - W3: probe-refused ledgers stamped `embedder = up`. A
+    run that never processed a frame never proved its
+    embedder for this run; an abort before the first frame
+    now stamps `down`.
+  - W4: "a black tile → zero vector" is a real embedder
+    shape (sparse/luminance features with nothing to fire),
+    not a defect; the BYO doc now names it and gives the
+    standard remedy (a constant bias component).
+  - W5 (partially declined): a `focus` explanation and
+    near-miss inspection were listed as missing surfaces;
+    the format doc's verdict table already explains focus,
+    and S2's counters are the near-miss surface — what was
+    actually missing was the config reference, now written.
+
+**Numbers.** Suite: 144 → **163 passed + 1 ignored**
+(+6 variance-watch unit tests, +1 score-observability unit
+test, +9 playtest-2 integration tests — probe refusals for
+the constant and jitter servers asserted at the ingest,
+the smart-collapse conviction and the transport-failure
+receipting asserted through the whole service, the watch's
+three record-driven fixtures — +2 summary-pairing tests,
++1 export-basis test, and the playtest battery's flaky
+fixture rebalanced by exactly the probe's one extra call:
+its budget comment now does the arithmetic in the open).
+`clippy --all-targets -D warnings` and `cargo fmt --check`
+clean. Staged acceptance re-run: **18 frames, 34 embeds,
+2 events, frame 4 = 16/16, frame 7 = {5, 6}, spend
+0.1181 — PASS**, exact — the acceptance now runs *through*
+the strengthened probe, and the hash double's discrimination
+is proven explicitly in the battery (its black/white
+distance asserted past the epsilon), not merely implied by
+the probe passing.
+
+**Version**: all three workspace crates 0.3.1 → 0.3.2;
+tagged v0.3.2 locally. Not pushed — publication stays the
+gated step, as before.

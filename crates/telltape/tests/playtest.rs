@@ -55,9 +55,11 @@ impl Drop for ServerGuard {
 /// One parameterized stand-in for the playtest's servers:
 /// `zero` returns [0.0]*1280 (the BYO sketch, verbatim in
 /// behaviour), `nan` returns NaNs, `flaky` answers healthy
-/// hash-expansion vectors for its first 20 calls (the probe
-/// plus frame 0's sixteen, plus three of frame 4's) and zeros
-/// from call 21 on — a mid-run degeneracy at frame 4, tile 3.
+/// hash-expansion vectors for its first 21 calls (the probe's
+/// black AND white tiles — two calls since playtest-2 B1
+/// strengthened the probe — plus frame 0's sixteen, plus
+/// three of frame 4's) and zeros from call 22 on — a mid-run
+/// degeneracy at frame 4, tile 3.
 const SERVER_PY: &str = r#"
 import hashlib, json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -65,7 +67,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 MODE = sys.argv[1]
 PORT = int(sys.argv[2])
 DIM = 1280
-BUDGET = 20
+BUDGET = 21
 calls = {"n": 0}
 
 def healthy(body):
@@ -159,7 +161,8 @@ fn degenerate_embedders_are_refused_at_the_probe() {
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("probe embedding is degenerate") && stderr.contains(reason),
+            stderr.contains("probe embedding for a black tile is degenerate")
+                && stderr.contains(reason),
             "{mode}: the refusal must name the defect: {stderr}"
         );
         assert!(
@@ -242,7 +245,12 @@ fn mid_run_degeneracy_stops_the_run_with_the_receipt() {
 /// The double lives under the same probe now: prove it can
 /// never trip the guard — black, white, gradient and two
 /// hundred random tiles all embed to finite, non-zero vectors,
-/// and the probe passes.
+/// and the probe passes. Playtest-2 B1 strengthened the probe
+/// a second way (collapse: black and white must embed FAR
+/// apart, past PROBE_DISCRIMINATION_EPSILON) and the staged
+/// acceptance depends on the double passing it — so the
+/// double's discrimination is proven here explicitly, not
+/// just implied by probe() returning.
 #[test]
 fn the_hash_double_can_never_be_degenerate() {
     let dir = tempdir("double");
@@ -251,7 +259,7 @@ fn the_hash_double_can_never_be_degenerate() {
     let mut f = std::fs::File::create(&script).unwrap();
     write!(
         f,
-        "import sys\nsys.path.insert(0, {ingest_dir:?})\nfrom ingest import HashEmbedder, degenerate_reason\nimport numpy as np\nemb = HashEmbedder(dim=1280)\nemb.probe()\nrng = np.random.default_rng(3)\ntiles = [np.zeros((128, 128, 3), dtype=np.float32), np.full((128, 128, 3), 255.0, dtype=np.float32)]\ntiles += [rng.normal(128, 40, (128, 128, 3)).astype(np.float32) for _ in range(200)]\nfor t in tiles:\n    vec, _ = emb.embed(t)\n    assert degenerate_reason(vec) is None, degenerate_reason(vec)\nprint('DOUBLE-OK')\n"
+        "import sys\nsys.path.insert(0, {ingest_dir:?})\nfrom ingest import HashEmbedder, degenerate_reason, cosine_distance, PROBE_DISCRIMINATION_EPSILON\nimport numpy as np\nemb = HashEmbedder(dim=1280)\nemb.probe()\nblack, _ = emb.embed(np.zeros((8, 8, 3), dtype=np.float32))\nwhite, _ = emb.embed(np.full((8, 8, 3), 255.0, dtype=np.float32))\nd = cosine_distance(black, white)\nassert d > PROBE_DISCRIMINATION_EPSILON, f'double does not discriminate: black/white distance {{d}}'\nprint(f'DOUBLE-DISCRIMINATES {{d:.4f}}')\nrng = np.random.default_rng(3)\ntiles = [np.zeros((128, 128, 3), dtype=np.float32), np.full((128, 128, 3), 255.0, dtype=np.float32)]\ntiles += [rng.normal(128, 40, (128, 128, 3)).astype(np.float32) for _ in range(200)]\nfor t in tiles:\n    vec, _ = emb.embed(t)\n    assert degenerate_reason(vec) is None, degenerate_reason(vec)\nprint('DOUBLE-OK')\n"
     )
     .unwrap();
     drop(f);
@@ -259,9 +267,12 @@ fn the_hash_double_can_never_be_degenerate() {
         .arg(&script)
         .output()
         .expect("run double check");
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("DOUBLE-OK"),
-        "stderr: {}",
+        out.status.success()
+            && stdout.contains("DOUBLE-OK")
+            && stdout.contains("DOUBLE-DISCRIMINATES"),
+        "stdout: {stdout} stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }

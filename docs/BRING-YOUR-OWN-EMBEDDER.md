@@ -40,10 +40,24 @@ seam.
 - **Response:** JSON; the vector is the array of numbers under
   the configured key (default `embedding`).
 - **Width:** the vector's length must equal `--embed-dim`
-  (default 1280). The ingest probes the adapter once at
-  startup with a synthetic tile and fails loudly there — a
-  width mismatch is a startup error, never a per-tile surprise
+  (default 1280). The ingest probes the adapter at startup
+  with synthetic tiles and fails loudly there — a width
+  mismatch is a startup error, never a per-tile surprise
   mid-stream.
+- **Health endpoint:** when `embed_url` is set, the service
+  requires `GET {origin}/health` — the embed URL's scheme and
+  authority, path discarded — to answer 200 **before the run
+  starts** (and, with `embedder_autostart`, to come up after
+  the start command). The body is not inspected; liveness is
+  all it attests. The config key `embed_health_url`
+  ([CONFIG.md](CONFIG.md)) overrides the derived URL when
+  your service puts health somewhere else. With no
+  `embed_url` (the test double, or a hand-driven ingest) no
+  check is possible and none is made. A service that only
+  implements the POST below will be reported down at startup
+  — this is the requirement a second cold playtest had to
+  discover by reading source, which is why it is stated here,
+  in the contract, in v0.3.2.
 - **Non-degeneracy:** the vector must carry information —
   every component finite, and a finite, non-zero norm. The
   startup probe checks this too, and the pipeline re-checks
@@ -58,17 +72,55 @@ seam.
   into a ledger of maximal "changes" that are really just
   pixel-diff nominations. (A cold playtest reproduced exactly
   that with the sketch below; v0.3.1 closed it.)
+  - *One shape to know about:* an embedder built from sparse
+    or luminance-only features can return the **zero vector
+    for a genuinely black tile** — not because it is broken,
+    but because an all-zero input has no features to fire.
+    That vector is degenerate by the rule above and will be
+    refused. The standard remedy is a constant bias component
+    (one always-on feature, e.g. a fixed first component), so
+    no real input maps to the zero vector.
+- **Discrimination:** non-degenerate is not enough — the
+  vector must *depend on the input*. The probe embeds two
+  synthetic tiles, one pure black and one pure white (the
+  most different inputs a tile can be), and requires their
+  embeddings to sit at cosine distance **> 0.01**; an
+  embedder answering both with the same valid vector — or
+  with vectors a jitter apart — is refused at startup with
+  the collapse named. The same requirement follows the run:
+  a variance watch at the seam tracks the run's actual
+  inputs, and if tiles whose pixels change materially keep
+  producing embeddings that do not move — and no varied
+  input ever moves one — the run stops with a typed error,
+  receipted as a `collapsed_embedder` service event, and
+  health stamps the embedder `collapsed` rather than `up`.
+  The invariant, stated once: **silence is only stamped
+  meaningful when the embedder has demonstrated
+  discrimination on this run's actual inputs.** A constant
+  embedder's quiet over a changing scene is not evidence of
+  a quiet scene, and since v0.3.2 the tool will not let it
+  be filed as any. (A uniformly blank scene never trips the
+  watch: the trigger is input variation *without* embedding
+  variation, never stillness itself.)
 - **Latency:** measured client-side per call and carried in
   the record stream (`embed_ms`); the ledger's budget meter is
   built from it, so an honest service needs no instrumentation
   of its own.
-- **Failures:** a non-200 or malformed response raises in the
-  ingest and stops the run. The tool does not invent vectors
+- **Failures:** a non-200 or malformed response stops the
+  run, classified: *transport* (the call itself failed — a
+  500, a dropped connection) or *response* (the answer could
+  not be read — bad JSON, the key missing, the width wrong).
+  The ingest reports the class to the service before exiting,
+  the service receipts it in the ledger as an `embedder_error`
+  service event and closes the run as aborted (health withdraws
+  the silence stamp), and the user sees one clean classified
+  line — not a stack trace. The tool does not invent vectors
   to keep going — a watch that guesses is worse than a watch
   that stops.
 
 A minimal service in Python's standard library (the shape,
-not a recommendation):
+not a recommendation) — health endpoint and real multipart
+parsing included, because both are part of the contract:
 
 ```python
 # embed_server.py — wrap YOUR model; this sketch only moves bytes.
@@ -84,12 +136,48 @@ def embed(png_bytes):            # <-- your model lives here
                                  # sketch is the shape, not a
                                  # runnable embedder.
 
+def multipart_field(body, content_type, field):
+    """The bytes of one field of a multipart/form-data body,
+    parsed with nothing but the standard library."""
+    boundary = None
+    for part in content_type.split(";"):
+        part = part.strip()
+        if part.startswith("boundary="):
+            boundary = part[len("boundary="):].strip('"')
+    if boundary is None:
+        raise ValueError("no boundary in Content-Type")
+    marker = b"--" + boundary.encode()
+    for chunk in body.split(marker):
+        if b"Content-Disposition" not in chunk:
+            continue
+        head, _, payload = chunk.partition(b"\r\n\r\n")
+        if f'name="{field}"' not in head.decode("utf-8", "replace"):
+            continue
+        if payload.endswith(b"\r\n"):
+            payload = payload[:-2]
+        return payload
+    raise ValueError(f"no field named {field!r}")
+
 class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        # The health endpoint the contract requires: liveness
+        # only — the body is never inspected.
+        if self.path == "/health":
+            payload = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
-        # (parse the multipart field in real life — e.g. with the
-        #  framework your model already uses)
-        payload = json.dumps({"embedding": embed(body)}).encode()
+        png = multipart_field(body, self.headers.get("Content-Type", ""), "file")
+        payload = json.dumps({"embedding": embed(png)}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -117,10 +205,43 @@ The numbers in the record — decision threshold 0.25,
 gate 3.0, α 0.1 — were calibrated against I-JEPA embeddings of
 these scenes. A different embedder is a different distance
 geometry: the same threshold can be hair-trigger or deaf.
-Budget for a calibration pass on your own footage before
-trusting verdicts: index a known stretch, read the raw scores
-in the ledger's per-tile rows, and set the threshold from
-what your scenes actually score. The gate's measured nature
-applies to every embedder: it is a **ranker, not a
+(A second cold playtest's honest luminance embedder scored a
+*full scene change* at 0.02–0.16; at the default 0.25 it
+would have reported nothing at all, meaningfully stamped.)
+
+Calibration reads from the ledger, and since v0.3.2 the
+ledger carries the two numbers the loop needs — in both
+`state.txt` and `health.txt`, updated every frame:
+
+- **`max_smoothed_score`** — the strongest smoothed score any
+  tile reached this run, published or not.
+- **`near_miss_frames`** — frames that published nothing but
+  whose best tile score reached at least 80% of the current
+  threshold.
+
+The loop:
+
+1. Run a stretch of footage you know — including at least
+   one change you care about and one quiet stretch.
+2. Read the two numbers. If the known change did not
+   publish, `max_smoothed_score` is what it actually scored:
+   your threshold must sit at or below it. If
+   `near_miss_frames` is large on the quiet stretch, scores
+   crowd the band just under your threshold: lower it only
+   with care, or quiet hours will start publishing noise.
+3. Set `threshold` in the config (see
+   [CONFIG.md](CONFIG.md)), rerun the same stretch, and
+   compare the published tells against what you know
+   happened. Two or three passes usually separate cleanly;
+   a geometry where the quiet band and the change scores
+   overlap has no good threshold, and learning that from the
+   numbers *is* the calibration succeeding.
+
+Published verdicts' per-tile rows remain in the ledger for
+the scores above threshold. What the two counters add is
+everything below it — before them, an unpublished frame left
+no row at all, so a near-miss was unobservable and the loop
+above could not be run from the record. The gate's measured
+nature applies to every embedder: it is a **ranker, not a
 separator**, so calibration is recurring work, not a one-time
 formality.

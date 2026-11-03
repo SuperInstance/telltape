@@ -73,6 +73,20 @@ pub struct Stats {
     pub consecutive_repeats: u64,
     pub tiles_nominated: u64,
     pub tiles_embedded: u64,
+    /// The strongest smoothed score any tile reached this run
+    /// (playtest-2 S2). Calibration needs the scores of frames
+    /// that did NOT publish — a near-miss leaves no verdict row,
+    /// so before this counter the most important calibration
+    /// data existed nowhere in the ledger.
+    pub max_smoothed_score: f64,
+    /// Frames that published nothing but whose best tile score
+    /// reached at least 80% of the threshold (playtest-2 S2):
+    /// the near-miss band. Together with `max_smoothed_score`
+    /// it makes calibration from the record possible — the
+    /// threshold should sit above this band's traffic and
+    /// at or below the scores of changes the operator cares
+    /// about (docs/BRING-YOUR-OWN-EMBEDDER.md, "Calibration").
+    pub near_miss_frames: u64,
     pub embeds_spent_s: f64,
     pub embed_ms_window: Vec<f64>,
     pub verdict_latency_ms: Vec<f64>,
@@ -161,6 +175,21 @@ pub struct Ledger {
     events: File,
     pub stats: Stats,
     pub embedder_up: bool,
+    /// The embedder answered, but its answers collapsed —
+    /// materially varied inputs produced embeddings that did
+    /// not move, and no varied input ever moved one (playtest-2
+    /// B1, the service's variance watch). Health reports the
+    /// embedder as `collapsed` (a third state, neither up nor
+    /// down), and silence loses its meaning: a collapsed
+    /// embedder's quiet is not evidence of anything.
+    pub embedder_collapsed: bool,
+    /// This run ended in a receipted failure (a degenerate or
+    /// collapsed embedder, an embedder transport failure, a
+    /// dead ingest), not a completed watch (playtest-2 S4).
+    /// While set, health never stamps silence meaningful: the
+    /// run's end is part of its record, and a health-only
+    /// reader must not be told the opposite of what happened.
+    pub run_aborted: bool,
     pub embedder_started_by_me: bool,
     pub soak: bool,
     pub threshold: f64,
@@ -248,6 +277,8 @@ impl Ledger {
             events,
             stats,
             embedder_up: false,
+            embedder_collapsed: false,
+            run_aborted: false,
             embedder_started_by_me: false,
             soak,
             threshold,
@@ -309,6 +340,21 @@ impl Ledger {
                 let e = s.tile_score_ema[tv.tile as usize];
                 s.tile_score_ema[tv.tile as usize] =
                     Some(e.map(|p| p * 0.9 + sc * 0.1).unwrap_or(sc));
+            }
+        }
+        // Score observability (playtest-2 S2): the run's ceiling
+        // and its near-miss band, from every frame — published
+        // or not. This is the only place unpublished frames'
+        // scores survive.
+        let frame_best = out
+            .tiles
+            .iter()
+            .filter_map(|tv| tv.smoothed_score)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if frame_best.is_finite() {
+            s.max_smoothed_score = s.max_smoothed_score.max(frame_best);
+            if !out.verdict.changed && frame_best >= 0.8 * self.threshold {
+                s.near_miss_frames += 1;
             }
         }
 
@@ -427,6 +473,35 @@ impl Ledger {
         }
     }
 
+    /// The embedder's state as state.txt / health.txt report
+    /// it: `collapsed` when the variance watch tripped (the
+    /// embedder answers, but its answers do not discriminate —
+    /// playtest-2 B1), else `up` / `down` on liveness.
+    pub fn embedder_state(&self) -> &'static str {
+        if self.embedder_collapsed {
+            "collapsed"
+        } else if self.embedder_up {
+            "up"
+        } else {
+            "down"
+        }
+    }
+
+    /// Whether this ledger's silence may be stamped meaningful:
+    /// the embedder is up, has not collapsed, the run has not
+    /// aborted, frames have been seen, and the source is not
+    /// frozen. Every clause is a failure that once wore the
+    /// stamp: a dead embedder (F1's family), a collapsed one
+    /// (playtest-2 B1), an unreceipted abort (playtest-2 S4),
+    /// a frozen feed (gap G1).
+    pub fn silence_meaningful(&self) -> bool {
+        self.embedder_up
+            && !self.embedder_collapsed
+            && !self.run_aborted
+            && self.stats.frames_seen > 0
+            && !self.stats.source_frozen()
+    }
+
     pub fn write_all(&self) -> std::io::Result<()> {
         std::fs::write(self.path("lens.txt"), self.lens_text())?;
         std::fs::write(self.path("state.txt"), self.state_text())?;
@@ -482,6 +557,14 @@ impl Ledger {
         t.push_str(&format!("frames_changed = {}\n", s.frames_changed));
         t.push_str(&format!("events_published = {}\n", s.events_published));
         t.push_str(&format!(
+            "max_smoothed_score = {:.4}\n",
+            s.max_smoothed_score
+        ));
+        t.push_str(&format!("near_miss_frames = {}\n", s.near_miss_frames));
+        if self.run_aborted {
+            t.push_str("run_outcome = aborted\n");
+        }
+        t.push_str(&format!(
             "last_frame = {}\n",
             s.last_frame
                 .map(|f| f.to_string())
@@ -496,10 +579,7 @@ impl Ledger {
             s.embed_everything_estimate_s()
         ));
         t.push_str(&format!("spend_ratio = {:.4}\n", s.spend_ratio()));
-        t.push_str(&format!(
-            "embedder = {}\n",
-            if self.embedder_up { "up" } else { "down" }
-        ));
+        t.push_str(&format!("embedder = {}\n", self.embedder_state()));
         t.push_str(&format!("embedder_identity = {}\n", self.embedder_identity));
         t.push_str(&format!(
             "embedder_started_by_me = {}\n",
@@ -527,14 +607,16 @@ impl Ledger {
             epoch_us().saturating_sub(s.last_frame_wall_us) as f64 / 1000.0
         };
         format!(
-            "embed_ms_p50 = {:.2}\nembed_ms_p99 = {:.2}\nembed_ms_n = {}\nframes_pending_max = {}\nlast_frame_age_ms = {:.1}\nembedder = {}\nembedder_identity = {}\nfreshness = {}\nframes_novel = {}\nframes_repeated = {}\nconsecutive_repeats = {}\nsilence_meaningful = {}\nupdated_wall_us = {}\n",
+            "embed_ms_p50 = {:.2}\nembed_ms_p99 = {:.2}\nembed_ms_n = {}\nframes_pending_max = {}\nlast_frame_age_ms = {:.1}\nembedder = {}\nembedder_identity = {}\nmax_smoothed_score = {:.4}\nnear_miss_frames = {}\nfreshness = {}\nframes_novel = {}\nframes_repeated = {}\nconsecutive_repeats = {}\nsilence_meaningful = {}\nupdated_wall_us = {}\n",
             p50,
             p99,
             s.embed_ms_window.len(),
             s.frames_pending_max,
             age_ms,
-            if self.embedder_up { "up" } else { "down" },
+            self.embedder_state(),
             self.embedder_identity,
+            s.max_smoothed_score,
+            s.near_miss_frames,
             self.freshness_label(),
             s.frames_novel,
             s.frames_repeated,
@@ -544,7 +626,9 @@ impl Ledger {
             // amendment: a *frozen* lane must not look calm either —
             // polls arriving is not evidence of life; image novelty
             // is. (13 h of the 2026-11 soak were counted this way.)
-            self.embedder_up && s.frames_seen > 0 && !s.source_frozen(),
+            // The full rule, incl. collapse and abort, lives in
+            // `silence_meaningful()`.
+            self.silence_meaningful(),
             epoch_us()
         )
     }
@@ -594,6 +678,73 @@ mod tests {
             tiles: (0..16).map(|t| tile_verdict(t, t == 5 || t == 6)).collect(),
             stage_ms: StageMs::default(),
         }
+    }
+
+    fn scored_output(best: f64, changed: bool) -> FrameOutput {
+        let mut tiles: Vec<TileVerdict> = (0..16)
+            .map(|t| TileVerdict {
+                frame: 9,
+                tile: t,
+                t_arrival_us: 0,
+                driver_diff: None,
+                raw_score: None,
+                smoothed_score: None,
+                changed_raw: false,
+                changed: false,
+                focus: false,
+                stale: true,
+                lineage_mask: 0,
+            })
+            .collect();
+        tiles[3].smoothed_score = Some(best);
+        tiles[3].stale = false;
+        FrameOutput {
+            verdict: FrameVerdict {
+                frame: 9,
+                changed,
+                changed_tiles: if changed { vec![3] } else { vec![] },
+                focus: if changed { vec![3] } else { vec![] },
+                energy_before: 0.5,
+                energy_after: 0.3,
+                records_in_frame: 1,
+            },
+            tiles,
+            stage_ms: StageMs::default(),
+        }
+    }
+
+    /// Playtest-2 S2: the score ceiling and the near-miss band
+    /// are recorded from every frame, published or not — the
+    /// calibration data that used to exist nowhere.
+    #[test]
+    fn score_observability_counts_the_ceiling_and_the_near_miss_band() {
+        let dir = tempdir("scores");
+        let mut l =
+            Ledger::open(&dir, "s", 0.25, 0.1, false, Grid::default(), "test-emb@1").unwrap();
+        // A published frame at 0.8: the ceiling moves; a
+        // published frame is by definition not a near miss.
+        l.record_frame(&scored_output(0.8, true), 1_000_000, 1, 1, &[], 0)
+            .unwrap();
+        assert_eq!(l.stats.max_smoothed_score, 0.8);
+        assert_eq!(l.stats.near_miss_frames, 0);
+        // A silent frame at 0.22 — 88% of the 0.25 threshold:
+        // a near miss, counted; the ceiling stays.
+        l.record_frame(&scored_output(0.22, false), 2_000_000, 1, 1, &[], 0)
+            .unwrap();
+        assert_eq!(l.stats.near_miss_frames, 1);
+        assert_eq!(l.stats.max_smoothed_score, 0.8);
+        // A silent frame at 0.19 — below the 80% band: neither.
+        l.record_frame(&scored_output(0.19, false), 3_000_000, 1, 1, &[], 0)
+            .unwrap();
+        assert_eq!(l.stats.near_miss_frames, 1);
+        // Both numbers are carried in state and health.
+        l.write_all().unwrap();
+        let state = std::fs::read_to_string(format!("{dir}/state.txt")).unwrap();
+        assert!(state.contains("max_smoothed_score = 0.8000"), "{state}");
+        assert!(state.contains("near_miss_frames = 1"), "{state}");
+        let health = std::fs::read_to_string(format!("{dir}/health.txt")).unwrap();
+        assert!(health.contains("max_smoothed_score = 0.8000"), "{health}");
+        assert!(health.contains("near_miss_frames = 1"), "{health}");
     }
 
     #[test]

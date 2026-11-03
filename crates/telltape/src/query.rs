@@ -1105,6 +1105,79 @@ fn stretches(rows: &[&ServiceRow], open: &str, close: &str) -> (Vec<(u64, Option
     (out, orphans)
 }
 
+/// Pair `stop` → `start` into service-stopped stretches over
+/// the FULL service record, then project onto the rows the
+/// caller's filters left visible (playtest-2 S3).
+///
+/// The rule, from the ledger's own semantics: `stop` is the
+/// final event a run writes — the service writes it as the
+/// run's closing act, and nothing of that run follows it — so
+/// a stop that no later start answers is the ledger's last
+/// run *ending*, not a stretch still open. (v0.3.1 paired
+/// stops and starts within the filtered rows alone, which
+/// reported exactly that terminal stop as an open stretch —
+/// plus an orphan note about the run's opening start — for
+/// every normally completed run.) A stretch is a stop answered
+/// by a later start; a start with no open stretch before it
+/// is a run *opening* and pairs with nothing (the ledger's
+/// first run, or one whose stop lies outside the record). A
+/// stretch could only be genuinely "still open" if rows after
+/// its stop proved the ledger kept being written while the
+/// service stayed down — but a run writes nothing after its
+/// stop, so under these semantics no such stretch exists; the
+/// pairing therefore returns closed stretches only.
+///
+/// The projection keeps `render_stretches`' vocabulary true
+/// of the *filter*, which is all it ever claimed: a stretch
+/// whose opening stop is in view renders as a duration when
+/// its closing start is also in view, and as "still open at
+/// the last row in the filter" when the filter clips the
+/// closing start away; a stretch wholly opened outside the
+/// view whose closing start falls inside it contributes one
+/// orphan (the start whose stop the filter hid).
+fn stopped_stretches(
+    data: &LedgerData,
+    visible: &[&ServiceRow],
+) -> (Vec<(u64, Option<u64>)>, usize) {
+    // Pair over the full record, in file order.
+    let mut full: Vec<(u64, u64)> = Vec::new();
+    let mut open_at: Option<u64> = None;
+    for s in &data.service {
+        match s.event.as_str() {
+            "stop" => {
+                if open_at.is_none() {
+                    open_at = Some(s.wall_us);
+                }
+            }
+            "start" => {
+                if let Some(o) = open_at.take() {
+                    full.push((o, s.wall_us));
+                }
+            }
+            _ => {}
+        }
+    }
+    // A leftover open_at is the terminal stop — a run ending,
+    // dropped deliberately (see the rule above).
+
+    let (lo, hi) = match (visible.first(), visible.last()) {
+        (Some(a), Some(b)) => (a.wall_us, b.wall_us),
+        _ => return (Vec::new(), 0),
+    };
+    let in_view = |w: u64| (lo..=hi).contains(&w);
+    let mut spans = Vec::new();
+    let mut orphans = 0usize;
+    for (open, close) in full {
+        match (in_view(open), in_view(close)) {
+            (true, true) => spans.push((open, Some(close))),
+            (true, false) => spans.push((open, None)),
+            (false, true) => orphans += 1,
+            (false, false) => {}
+        }
+    }
+    (spans, orphans)
+}
+
 fn render_stretches(
     title: &str,
     found: &[(u64, Option<u64>)],
@@ -1231,7 +1304,9 @@ fn render_summary(
             zone,
         ));
     }
-    let (stopped, stopped_orphans) = stretches(service, "stop", "start");
+    // Stopped stretches pair over the full record, not the
+    // filtered rows (playtest-2 S3 — see stopped_stretches).
+    let (stopped, stopped_orphans) = stopped_stretches(data, service);
     t.push('\n');
     t.push_str(&render_stretches(
         "service-stopped stretches (stop -> start)",

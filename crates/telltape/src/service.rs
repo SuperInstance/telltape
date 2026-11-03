@@ -39,10 +39,39 @@
 //! `degenerate_embedder` service event — frame and tile named —
 //! before returning the typed error. A broken embedder stops
 //! the watch; it never gets to author a confident ledger.
+//!
+//! Collapsed embeddings (playtest-2 B1): a subtler failure —
+//! the embedder answers promptly, at the right width, with
+//! finite unit vectors that are the *same* for every input.
+//! Every per-vector check passes and every score is 0, so the
+//! run completes in stamped-meaningful silence over real
+//! change. The invariant this loop enforces: **silence may
+//! only be stamped meaningful when the embedder has
+//! demonstrated discrimination on this run's actual inputs.**
+//! The ingest's probe demonstrates it synthetically (black vs
+//! white) before the run; the variance watch here is the
+//! run-time half — it tracks the relationship between input
+//! variation (the gate's per-tile diffs) and embedding
+//! variation (the decide scores) and, when materially varied
+//! inputs have *never* moved an embedding past a trip count
+//! of observations, receipts a `collapsed_embedder` event,
+//! stamps the embedder `collapsed` in health, withdraws the
+//! silence stamp, and stops the run (see [`CollapseWatch`]
+//! for the thresholds and the reasoning). A uniformly blank
+//! scene cannot trip it: the trigger is input variation
+//! *without* embedding variation, never low variance alone.
+//!
+//! Transport failures (playtest-2 S4): when an embedder call
+//! fails mid-run the ingest classifies it (transport /
+//! response) on an `ingest_error` control line before exiting;
+//! this loop receipts it as an `embedder_error` service event
+//! and closes the run as aborted — health is never left
+//! claiming the embedder up and the silence meaningful over
+//! an unreceipted abort, and no raw traceback reaches the user.
 
 use crate::config::{Config, ConfigError};
 use crate::ledger::{epoch_us, Ledger, RecordedIdentity};
-use crate::live::LivePipeline;
+use crate::live::{FrameOutput, LivePipeline};
 use harbor_watch::pipeline::{Config as PipeConfig, PipelineError};
 use harbor_watch::record::{parse_record, InputRecord};
 use std::fmt;
@@ -84,6 +113,23 @@ pub enum ServiceError {
     Ingest(std::io::Error),
     /// The cascade refused a frame (bad record in the stream).
     Pipeline(PipelineError),
+    /// The embedder collapsed (playtest-2 B1): it kept
+    /// answering — right width, finite, non-zero — but its
+    /// answers did not discriminate this run's inputs:
+    /// `observations` tile observations whose pixels changed
+    /// materially produced embeddings that did not move, and
+    /// no materially varied input ever moved one. The run is
+    /// stopped and the stop receipted, on the degenerate
+    /// path's precedent: continuing would keep writing a
+    /// ledger whose silence is stamped meaningful by an
+    /// embedder that cannot see — and the frames already
+    /// written cannot be told apart from a genuinely quiet
+    /// scene, which is exactly why the run must not go on
+    /// lending them its stamp.
+    EmbedderCollapsed {
+        /// Varied-but-unmoved tile observations counted.
+        observations: u64,
+    },
 }
 
 impl fmt::Display for ServiceError {
@@ -113,6 +159,17 @@ impl fmt::Display for ServiceError {
             ),
             ServiceError::Ingest(e) => write!(f, "ingest: {e}"),
             ServiceError::Pipeline(e) => write!(f, "pipeline: {e}"),
+            ServiceError::EmbedderCollapsed { observations } => write!(
+                f,
+                "embedder collapsed: {observations} tile observations whose pixels \
+                 changed materially (diff >= {VARIED_DIFF_MIN}) produced embeddings \
+                 that did not move (score <= {UNMOVED_SCORE_MAX}), and no varied \
+                 input ever moved an embedding — the embedder is answering, but \
+                 its answers do not discriminate this run's inputs, so its silence \
+                 would mean nothing. Run stopped and receipted as \
+                 collapsed_embedder; check the embedder service (a constant or \
+                 near-constant response is the usual cause)"
+            ),
         }
     }
 }
@@ -154,6 +211,105 @@ pub struct Summary {
     pub verdict_latency_basis: &'static str,
     pub embedder_started_by_me: bool,
     pub embedder_stopped_by_me: bool,
+}
+
+/// A tile's pixels "varied materially" at this mean-abs diff
+/// (0..=255, the ingest gate's own units). The gate nominates
+/// at `gate_diff` (default 3.0); 10.0 is more than 3× that —
+/// a change the pixel layer is sure about. In the measured
+/// record: staged cut tiles diff ~64, the object tiles ~20–60,
+/// the drift the gate must ignore ~1.2 per frame. A tile whose
+/// diff never reaches this line is not evidence about the
+/// embedder either way.
+pub const VARIED_DIFF_MIN: f64 = 10.0;
+
+/// An embedding "did not move" at or below this cosine
+/// distance. Identical vectors score exactly 0; a
+/// near-constant server's float32 jitter scores ≲1e-3; the
+/// weakest honest geometry in the record (cold playtest 2's
+/// luminance embedder) scored ≥0.02 on every real change it
+/// was shown. 0.005 sits between jitter and signal.
+pub const UNMOVED_SCORE_MAX: f64 = 0.005;
+
+/// Varied-but-unmoved observations that trip the watch. On
+/// the default 4×4 grid this is three quarters of a full
+/// frame changing at once, or the same evidence spread over
+/// several frames — far beyond one tile's repeated subtlety
+/// (a single tile whose change a real embedder legitimately
+/// scores near zero can contribute at most one observation
+/// per frame, and exoneration needs only one moved varied
+/// input anywhere in the run).
+pub const COLLAPSE_TRIP_OBSERVATIONS: u64 = 12;
+
+/// The run-time variance watch (playtest-2 B1): fed each
+/// processed frame's tile verdicts, it tracks the relationship
+/// between input variation and embedding variation.
+///
+/// - A tile observation is *varied* when its driver diff (the
+///   gate's mean-abs pixel diff for this frame) reaches
+///   [`VARIED_DIFF_MIN`], and *moved* when its raw score (the
+///   decide stage's cosine distance from the tile's previous
+///   embedding) exceeds [`UNMOVED_SCORE_MAX`].
+/// - One moved varied observation *demonstrates* the embedder
+///   for the whole run: it can, in fact, tell this run's
+///   inputs apart. The watch then stands down permanently —
+///   demonstration is the invariant's currency, and it is not
+///   un-earned by later quiet.
+/// - Varied-but-unmoved observations accumulate. At
+///   [`COLLAPSE_TRIP_OBSERVATIONS`] with no demonstration,
+///   the watch trips: for this run, on this run's actual
+///   inputs, the embedder has answered materially different
+///   tiles with indistinguishable vectors every single time.
+///
+/// A uniformly blank scene produces no varied observations
+/// at all, so the watch cannot trip on quiet — the trigger is
+/// variation without response, never stillness itself.
+#[derive(Debug, Default)]
+pub struct CollapseWatch {
+    varied_unmoved: u64,
+    demonstrated: bool,
+}
+
+impl CollapseWatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one processed frame's output.
+    pub fn observe(&mut self, out: &FrameOutput) {
+        for tv in &out.tiles {
+            if tv.stale {
+                continue;
+            }
+            let (Some(score), Some(diff)) = (tv.raw_score, tv.driver_diff) else {
+                continue;
+            };
+            if diff >= VARIED_DIFF_MIN {
+                if score > UNMOVED_SCORE_MAX {
+                    self.demonstrated = true;
+                } else {
+                    self.varied_unmoved += 1;
+                }
+            }
+        }
+    }
+
+    /// Whether the watch has tripped: enough varied inputs
+    /// went unanswered, and none was ever answered.
+    pub fn tripped(&self) -> bool {
+        !self.demonstrated && self.varied_unmoved >= COLLAPSE_TRIP_OBSERVATIONS
+    }
+
+    /// Varied-but-unmoved observations counted so far.
+    pub fn observations(&self) -> u64 {
+        self.varied_unmoved
+    }
+
+    /// Whether discrimination has been demonstrated on this
+    /// run's actual inputs.
+    pub fn demonstrated(&self) -> bool {
+        self.demonstrated
+    }
 }
 
 /// Extract a numeric field from a JSON line without a JSON parser
@@ -395,12 +551,26 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
     let mut frames_received: u64 = 0;
     let mut verdict_latencies: Vec<f64> = Vec::new();
     let mut summary = Summary::default();
+    // Playtest-2 B1: the variance watch over this run's frames.
+    let mut watch = CollapseWatch::new();
+    // Playtest-2 S4: the ingest's classified account of its own
+    // failure, when it sent one (`ingest_error` control line):
+    // (class, message) — receipted on arrival, and used to
+    // enrich the error this run returns when the stream ends.
+    let mut ingest_failure: Option<(String, String)> = None;
+    let mut read_error: Option<std::io::Error> = None;
 
     let mut ended_by_eof = false;
     let mut line = String::new();
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).map_err(ServiceError::Ingest)?;
+        let n = match reader.read_line(&mut line) {
+            Ok(n) => n,
+            Err(e) => {
+                read_error = Some(e);
+                break;
+            }
+        };
         if n == 0 {
             ended_by_eof = true;
             break; // ingest EOF: end of stream (its exit status is checked below)
@@ -410,6 +580,27 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
             continue;
         }
         if line.contains("\"control\"") {
+            if line.contains("\"ingest_error\"") {
+                // Playtest-2 S4: the ingest classified its own
+                // failure (an embedder call died mid-run) and is
+                // on its way out. Receipt it NOW, in the ledger
+                // itself — the failure is part of the run's
+                // record, next to the tells it interrupted.
+                let class = json_str(line, "class").unwrap_or_else(|| "internal".to_string());
+                let msg = json_str(line, "msg").unwrap_or_default();
+                ledger
+                    .service_event(
+                        "embedder_error",
+                        &format!(
+                            "embedder call failed ({class}): {msg}; run aborted — the tells before this point stand, and nothing after it was seen"
+                        ),
+                    )
+                    .ok();
+                ledger.run_aborted = true;
+                ledger.write_all().ok();
+                ingest_failure = Some((class, msg));
+                continue;
+            }
             if line.contains("\"frame_end\"") {
                 let frame = json_num(line, "frame").unwrap_or(0.0) as u32;
                 let t_capture_us = json_num(line, "t_capture_us").unwrap_or(0.0) as u64;
@@ -500,7 +691,12 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
                             // and tile that carried the defect.
                             // Tells written before this frame
                             // stand; nothing is written from the
-                            // degenerate vector.
+                            // degenerate vector. Any other
+                            // pipeline refusal is receipted as a
+                            // plain abort (playtest-2 S4's rule:
+                            // a run's failure is part of its
+                            // record, and health must not go on
+                            // stamping the silence meaningful).
                             if let PipelineError::DegenerateEmbedding {
                                 frame: df,
                                 tile,
@@ -516,11 +712,52 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
                                         ),
                                     )
                                     .ok();
-                                ledger.write_all().ok();
+                            } else {
+                                ledger
+                                    .service_event(
+                                        "run_aborted",
+                                        &format!(
+                                            "pipeline refused a frame: {e}; run aborted — the tells before this point stand, and nothing after it was seen"
+                                        ),
+                                    )
+                                    .ok();
+                            }
+                            ledger.run_aborted = true;
+                            ledger.write_all().ok();
+                            if let Some(mut c) = child.take() {
+                                let _ = c.kill();
+                                let _ = c.wait();
                             }
                             return Err(e.into());
                         }
                     };
+                    // Playtest-2 B1: the variance watch. Fed
+                    // before the frame is recorded — the frame
+                    // that trips it is not written, on the
+                    // degenerate path's precedent (the frame that
+                    // proves the embedder broken does not get to
+                    // author state), and the stop is receipted
+                    // with the counts that convicted it.
+                    watch.observe(&out);
+                    if watch.tripped() {
+                        let observations = watch.observations();
+                        ledger
+                            .service_event(
+                                "collapsed_embedder",
+                                &format!(
+                                    "embedder collapsed: {observations} tile observations with materially changed pixels (diff >= {VARIED_DIFF_MIN}) produced embeddings that did not move (score <= {UNMOVED_SCORE_MAX}), and no varied input ever moved one; run stopped — an embedder that cannot discriminate this run's inputs must not stamp its silence meaningful"
+                                ),
+                            )
+                            .ok();
+                        ledger.embedder_collapsed = true;
+                        ledger.run_aborted = true;
+                        ledger.write_all().ok();
+                        if let Some(mut c) = child.take() {
+                            let _ = c.kill();
+                            let _ = c.wait();
+                        }
+                        return Err(ServiceError::EmbedderCollapsed { observations });
+                    }
                     if let Some(lat) = ledger.record_frame(
                         &out,
                         t_capture_us,
@@ -563,6 +800,31 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
         }
     }
 
+    if let Some(e) = read_error {
+        // The record stream itself failed to read. The run is
+        // over and its end is receipted like any other abort
+        // (playtest-2 S4): health must not be left claiming a
+        // clean watch over a stream that broke.
+        ledger
+            .service_event(
+                "run_aborted",
+                &format!(
+                    "ingest stream failed to read: {e}; run aborted — the tells before this point stand, and nothing after it was seen"
+                ),
+            )
+            .ok();
+        ledger.run_aborted = true;
+        if frames_processed == 0 {
+            ledger.embedder_up = false;
+        }
+        ledger.write_all().ok();
+        if let Some(mut c) = child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        return Err(ServiceError::Ingest(e));
+    }
+
     if let Some(mut c) = child {
         if ended_by_eof {
             // The ingest ended the stream itself. Its exit status
@@ -574,8 +836,39 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
             // killed below and its status is meaningless.)
             match c.wait() {
                 Ok(status) if !status.success() => {
+                    // Playtest-2 S4 / W3: the abort is receipted
+                    // and stamped before the error returns. If
+                    // the ingest classified its own failure, its
+                    // `embedder_error` receipt already stands and
+                    // the returned error carries the class; an
+                    // unclassified death gets the generic abort
+                    // receipt. A run that never processed a frame
+                    // never proved its embedder for this run —
+                    // health must not stamp it `up` (the probe-
+                    // refused ledgers of both playtests did).
+                    if ingest_failure.is_none() {
+                        ledger
+                            .service_event(
+                                "run_aborted",
+                                &format!(
+                                    "ingest exited with {status} after {frames_received} frames; run aborted — the tells before this point stand, and nothing after it was seen"
+                                ),
+                            )
+                            .ok();
+                    }
+                    ledger.run_aborted = true;
+                    if frames_processed == 0 {
+                        ledger.embedder_up = false;
+                    }
+                    ledger.write_all().ok();
+                    let detail = match &ingest_failure {
+                        Some((class, msg)) => {
+                            format!(" (embedder call failed ({class}): {msg})")
+                        }
+                        None => String::new(),
+                    };
                     return Err(ServiceError::Ingest(std::io::Error::other(format!(
-                        "ingest command exited with {status} after {frames_received} frames"
+                        "ingest command exited with {status} after {frames_received} frames{detail}"
                     ))));
                 }
                 Ok(_) => {}
@@ -626,4 +919,148 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
     ledger.write_all().ok();
     let _ = epoch_us();
     Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harbor_watch::pipeline::{FrameVerdict, TileVerdict};
+
+    fn tile(tile: u32, diff: Option<f64>, score: Option<f64>, stale: bool) -> TileVerdict {
+        TileVerdict {
+            frame: 1,
+            tile,
+            t_arrival_us: 0,
+            driver_diff: diff,
+            raw_score: score,
+            smoothed_score: score,
+            changed_raw: false,
+            changed: false,
+            focus: false,
+            stale,
+            lineage_mask: 0,
+        }
+    }
+
+    fn frame(tiles: Vec<TileVerdict>) -> FrameOutput {
+        FrameOutput {
+            verdict: FrameVerdict {
+                frame: 1,
+                changed: false,
+                changed_tiles: vec![],
+                focus: vec![],
+                energy_before: 0.0,
+                energy_after: 0.0,
+                records_in_frame: tiles.len(),
+            },
+            tiles,
+            stage_ms: crate::live::StageMs::default(),
+        }
+    }
+
+    /// Playtest-2 B1, the conviction: a full frame of tiles
+    /// whose pixels changed materially and whose embeddings
+    /// did not move at all trips the watch in one frame.
+    #[test]
+    fn varied_inputs_that_never_move_embeddings_trip_the_watch() {
+        let mut w = CollapseWatch::new();
+        w.observe(&frame(
+            (0..16)
+                .map(|t| tile(t, Some(64.0), Some(0.0), false))
+                .collect(),
+        ));
+        assert!(w.tripped());
+        assert_eq!(w.observations(), 16);
+        assert!(!w.demonstrated());
+    }
+
+    /// The trip is a count across frames, not a per-frame
+    /// verdict: partial change spread over frames accumulates.
+    #[test]
+    fn the_trip_count_accumulates_across_frames() {
+        let mut w = CollapseWatch::new();
+        for _ in 0..2 {
+            w.observe(&frame(
+                (0..5)
+                    .map(|t| tile(t, Some(30.0), Some(0.001), false))
+                    .collect(),
+            ));
+            assert!(!w.tripped(), "10 observations is not yet a conviction");
+        }
+        w.observe(&frame(
+            (0..2)
+                .map(|t| tile(t, Some(30.0), Some(0.0), false))
+                .collect(),
+        ));
+        assert!(w.tripped(), "the 12th unmoved varied input trips it");
+    }
+
+    /// The honest blank wall: embeddings never vary AND
+    /// inputs never vary. Nothing is counted; nothing trips;
+    /// the run's silence keeps its meaning.
+    #[test]
+    fn a_uniformly_blank_scene_can_never_trip_it() {
+        let mut w = CollapseWatch::new();
+        for _ in 0..50 {
+            w.observe(&frame(
+                (0..16)
+                    .map(|t| tile(t, Some(0.4), Some(0.0), false))
+                    .collect(),
+            ));
+        }
+        assert!(!w.tripped());
+        assert_eq!(w.observations(), 0);
+    }
+
+    /// One varied input that moves an embedding demonstrates
+    /// the embedder for the run — permanently. Later unmoved
+    /// observations cannot un-demonstrate it.
+    #[test]
+    fn one_moved_varied_input_demonstrates_for_the_run() {
+        let mut w = CollapseWatch::new();
+        w.observe(&frame(vec![tile(3, Some(50.0), Some(0.4), false)]));
+        assert!(w.demonstrated());
+        w.observe(&frame(
+            (0..16)
+                .map(|t| tile(t, Some(64.0), Some(0.0), false))
+                .collect(),
+        ));
+        assert!(!w.tripped());
+    }
+
+    /// Unscored and stale tiles are not evidence: frame 0's
+    /// baselines (no score), tiles the frame did not refresh,
+    /// and varied-but-unmeasured tiles count for nothing.
+    #[test]
+    fn unscored_and_stale_tiles_are_not_evidence() {
+        let mut w = CollapseWatch::new();
+        w.observe(&frame(
+            (0..16).map(|t| tile(t, Some(64.0), None, false)).collect(),
+        ));
+        w.observe(&frame(
+            (0..16)
+                .map(|t| tile(t, Some(64.0), Some(0.0), true))
+                .collect(),
+        ));
+        w.observe(&frame(
+            (0..16).map(|t| tile(t, None, Some(0.0), false)).collect(),
+        ));
+        assert_eq!(w.observations(), 0);
+        assert!(!w.tripped());
+    }
+
+    /// Sub-threshold score movement on a varied input is
+    /// still "did not move" — the near-constant embedder's
+    /// jitter must not exonerate it.
+    #[test]
+    fn jitter_below_the_floor_does_not_demonstrate() {
+        let mut w = CollapseWatch::new();
+        w.observe(&frame(
+            (0..16)
+                .map(|t| tile(t, Some(64.0), Some(UNMOVED_SCORE_MAX), false))
+                .collect(),
+        ));
+        assert!(w.tripped());
+        assert!(!w.demonstrated());
+    }
 }

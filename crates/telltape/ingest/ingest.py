@@ -11,6 +11,14 @@ tile) plus a frame_end control line per frame:
   {"control":"frame_end","frame":F,"t_capture_us":<capture epoch us>,
    "nominated":K,"gate_diff":G,"frame_hash":H,"frame_repeat":false,
    "time_anchor":A}
+  {"control":"ingest_error","class":C,"msg":M}
+
+   The ingest_error line is emitted once, on the way out, when
+   an embedder call fails mid-run (playtest-2 S4): C classifies
+   the failure (transport / response) so the service can
+   receipt it in the ledger as an `embedder_error` service
+   event before the stream ends — the run's failure is part of
+   the ledger's own record, not just a console traceback.
 
    A names how the capture times were anchored (playtest F8):
    capture_clock for live sources; for the file source, the
@@ -145,6 +153,45 @@ def degenerate_reason(vec):
     return None
 
 
+def cosine_distance(a, b):
+    """Cosine distance between two sound vectors (both already
+    passed degenerate_reason), in float64."""
+    va = np.asarray(a, dtype=np.float64)
+    vb = np.asarray(b, dtype=np.float64)
+    return float(1.0 - (va @ vb) / (np.linalg.norm(va) * np.linalg.norm(vb)))
+
+
+# The probe's discrimination floor (playtest-2 B1): a black tile
+# and a white tile are maximally different inputs — the two ends
+# of everything a tile can be. An embedder whose answers for
+# them land within this cosine distance of each other has
+# demonstrated no usable discrimination: the decision thresholds
+# in this tool's record live at 0.05..0.30, and float32 rounding
+# of a near-identical pair sits at ~1e-6, so 0.01 is orders of
+# magnitude above noise and well below any real geometry's
+# black/white separation. A constant (or near-constant)
+# embedder scores ~0 here and is refused at the probe — the
+# run-time variance watch in the Rust service is the backstop
+# for an embedder that discriminates THESE tiles but collapses
+# on real ones.
+PROBE_DISCRIMINATION_EPSILON = 0.01
+
+
+class EmbedCallError(Exception):
+    """An embedder call failed mid-run. `kind` classifies the
+    failure for the service's ledger receipt (playtest-2 S4):
+    `transport` (the HTTP call itself failed — status, connect,
+    timeout), `response` (an answer arrived but could not be
+    read as a vector), `internal` (anything else in the ingest).
+    The service receipts the class in an `embedder_error`
+    service event; the message reaches the user as one clean
+    line, never a traceback."""
+
+    def __init__(self, kind, msg):
+        super().__init__(msg)
+        self.kind = kind
+
+
 class Embedder:
     """The seam: embed(tile_img) -> (vector, embed_ms).
 
@@ -160,23 +207,46 @@ class Embedder:
         raise NotImplementedError
 
     def probe(self):
-        """Embed one tiny synthetic tile and verify the result:
-        the width, AND that the vector is not degenerate
-        (playtest F1 — the probe used to check width only, so a
-        service returning a zero vector for every tile passed
-        it and went on to author a confident, wrong ledger)."""
-        tile = np.zeros((8, 8, 3), dtype=np.float32)
-        vec, _ = self.embed(tile)
-        if len(vec) != self.dim:
+        """Embed two tiny synthetic tiles — one black, one
+        white, the maximally different inputs a tile can be —
+        and verify the results: the width, that neither vector
+        is degenerate (playtest F1 — the probe used to check
+        width only, so a service returning a zero vector for
+        every tile passed it and went on to author a confident,
+        wrong ledger), AND that the two answers differ
+        (playtest-2 B1): an embedder returning the same valid
+        vector for every input passes width and degeneracy
+        while seeing nothing, and its silence would be stamped
+        meaningful over real change. Discrimination must be
+        demonstrated, here on synthetic opposites and later by
+        the service's variance watch on the run's real inputs,
+        before silence may mean anything."""
+        black = np.zeros((8, 8, 3), dtype=np.float32)
+        white = np.full((8, 8, 3), 255.0, dtype=np.float32)
+        vecs = {}
+        for label, tile in (("black", black), ("white", white)):
+            vec, _ = self.embed(tile)
+            if len(vec) != self.dim:
+                raise RuntimeError(
+                    f"embedder {self.name}: probe returned dim {len(vec)} "
+                    f"for a {label} tile, expected {self.dim} — fix "
+                    f"--embed-dim or the service")
+            reason = degenerate_reason(vec)
+            if reason is not None:
+                raise RuntimeError(
+                    f"embedder {self.name}: probe embedding for a {label} "
+                    f"tile is degenerate ({reason}) — a vector with no "
+                    f"information cannot be scored; refusing to start")
+            vecs[label] = vec
+        d = cosine_distance(vecs["black"], vecs["white"])
+        if d <= PROBE_DISCRIMINATION_EPSILON:
             raise RuntimeError(
-                f"embedder {self.name}: probe returned dim {len(vec)}, "
-                f"expected {self.dim} — fix --embed-dim or the service")
-        reason = degenerate_reason(vec)
-        if reason is not None:
-            raise RuntimeError(
-                f"embedder {self.name}: probe embedding is degenerate "
-                f"({reason}) — a vector with no information cannot "
-                f"be scored; refusing to start")
+                f"embedder {self.name}: probe collapse: a black tile and "
+                f"a white tile embed at cosine distance {d:.6f} of each "
+                f"other (must exceed {PROBE_DISCRIMINATION_EPSILON}) — "
+                f"the embedder returns (near-)identical vectors for "
+                f"demonstrably different inputs, so nothing it reports "
+                f"can distinguish change from stillness; refusing to start")
         return True
 
 
@@ -283,9 +353,25 @@ class Emitter:
         self.time_anchor = "capture_clock"
 
     def embed(self, tile_img):
-        vec, ms = self.embedder.embed(tile_img)
+        """One embedder call, with failures classified for the
+        service's receipt (playtest-2 S4): a transport failure
+        and an unreadable answer are different defects, and the
+        ledger should say which one ended the run. The raw
+        exception never propagates — the user and the service
+        both get the classified, one-line form."""
+        try:
+            vec, ms = self.embedder.embed(tile_img)
+        except requests.exceptions.RequestException as e:
+            raise EmbedCallError(
+                "transport", f"{type(e).__name__}: {e}") from e
+        except (KeyError, ValueError, TypeError, IndexError) as e:
+            raise EmbedCallError(
+                "response",
+                f"unreadable embedder response: {type(e).__name__}: {e}"
+            ) from e
         if len(vec) != self.embedder.dim:
-            raise RuntimeError(
+            raise EmbedCallError(
+                "response",
                 f"embedder {self.embedder.name}: dim {len(vec)} "
                 f"!= configured {self.embedder.dim}")
         return vec, ms
@@ -666,24 +752,60 @@ def main():
         gen = mjpeg_frames(args.url, args.cadence_ms)
 
     idx = 0
-    for item in gen:
-        t0 = time.time()
-        img, t_capture = item if timed else (item, None)
-        if img.shape[0] != 512 or img.shape[1] != 512:
-            img = np.asarray(Image.fromarray(img.astype(np.uint8)).resize((512, 512)),
-                             dtype=np.float32)
-        em.frame(img, idx, t_capture)
-        idx += 1
-        if args.max_frames and idx >= args.max_frames:
-            break
-        if not timed:
-            # Live sources pace themselves by cadence; file replay
-            # is batch work and runs as fast as it can be read.
-            wait = args.cadence_ms / 1000.0 - (time.time() - t0)
-            if wait > 0:
-                time.sleep(wait)
+    try:
+        for item in gen:
+            t0 = time.time()
+            img, t_capture = item if timed else (item, None)
+            if img.shape[0] != 512 or img.shape[1] != 512:
+                img = np.asarray(Image.fromarray(img.astype(np.uint8)).resize((512, 512)),
+                                 dtype=np.float32)
+            em.frame(img, idx, t_capture)
+            idx += 1
+            if args.max_frames and idx >= args.max_frames:
+                break
+            if not timed:
+                # Live sources pace themselves by cadence; file replay
+                # is batch work and runs as fast as it can be read.
+                wait = args.cadence_ms / 1000.0 - (time.time() - t0)
+                if wait > 0:
+                    time.sleep(wait)
+    except EmbedCallError as e:
+        # Playtest-2 S4: a mid-run embedder failure is receipted
+        # by the service (an `embedder_error` service event with
+        # this class) and reaches the user as one clean line —
+        # the v0.3.1 behaviour sprayed a raw requests traceback
+        # and left the ledger claiming the embedder was up over
+        # an unclosed run. The control line goes on stdout, the
+        # record stream the service is already reading; the
+        # human line goes on stderr; the exit is a plain 1.
+        msg = str(e).replace('"', "'")[:300]
+        print(json.dumps({"control": "ingest_error", "class": e.kind,
+                          "msg": msg}), flush=True)
+        print(f"ingest: embedder call failed ({e.kind}): {msg}",
+              file=sys.stderr)
+        return 1
+    except BrokenPipeError:
+        # The service closed the record stream (it ended the
+        # run — a refusal, a stop file, its own exit). Dying
+        # quietly is the whole job here (playtest-2 W1: the
+        # traceback landed on exactly the runs a user inspects).
+        return 0
+    except Exception as e:
+        # Any other mid-run failure (a source dying, a decoder
+        # error): one clean line, a plain exit — no traceback.
+        msg = f"{type(e).__name__}: {e}".replace('"', "'")[:300]
+        print(f"ingest: run failed: {msg}", file=sys.stderr)
+        return 1
     return 0
 
 
 if __name__ == "__main__":
+    # Playtest-2 W1: Python ignores SIGPIPE by default, so a
+    # service closing the record stream mid-print surfaced as a
+    # BrokenPipeError traceback across the runs a user inspects
+    # most closely. Restore the Unix default — die silently by
+    # the signal — and keep the BrokenPipeError catch in main()
+    # as the second line for buffered flushes.
+    import signal
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     sys.exit(main())

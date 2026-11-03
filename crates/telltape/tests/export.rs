@@ -379,3 +379,69 @@ fn binary_csv_export_reports_malformed_on_stderr() {
         "the note stays off stdout: {stdout}"
     );
 }
+
+/// Playtest-2 S5: the `verdict_latency_ms` numbers travel
+/// with their basis. The playtest exported a 2-second stills
+/// job whose latency column read 147,566 ms — processing lag
+/// behind the footage timeline, presented bare as if it were
+/// verdict computation time. JSON carries the basis in its
+/// metadata (footage and live each named); CSV, whose header
+/// is a pinned format, states it on stderr and keeps stdout
+/// byte-pure.
+#[test]
+fn latency_basis_travels_with_the_export() {
+    // Live ledger (fixture A): capture-to-ledger-write.
+    let dir = fixture_a("latency-live");
+    let report = run_export(&dir, &QueryFilters::default(), ExportFormat::Json).unwrap();
+    assert!(
+        report
+            .document
+            .contains("\"verdict_latency_basis\": \"capture_to_ledger_write\""),
+        "{}",
+        report.document
+    );
+    assert_eq!(report.verdict_latency_basis, "capture_to_ledger_write");
+
+    // Footage ledger: processing lag behind the footage
+    // timeline — the basis the playtest's number actually had.
+    let fdir = tempdir("latency-footage");
+    std::fs::write(
+        format!("{fdir}/lens.txt"),
+        "stream_id = yard\ngrid = 4x4\nembedder_identity = double@1\nsource_kind = footage\ntime_anchor = file_mtime\nperiod_ms = unknown\njitter_ms = unknown\nthreshold = 0.2500\nalpha = 0.1000\nframes_observed = 20\n",
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{fdir}/events.jsonl"),
+        format!(
+            "{}\n",
+            verdict_row("yard", 12, 1_793_649_700_000_000, &[5, 6], 2)
+        ),
+    )
+    .unwrap();
+    let report = run_export(&fdir, &QueryFilters::default(), ExportFormat::Json).unwrap();
+    assert!(
+        report
+            .document
+            .contains("\"verdict_latency_basis\": \"processing_lag_behind_footage_timeline\""),
+        "{}",
+        report.document
+    );
+
+    // CSV: the header stays exactly the pinned string, the
+    // basis is stated on stderr, and stdout carries neither.
+    let (code, stdout, stderr) = run_bin(&["export", &dir, "--format", "csv"], &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("verdict_latency_ms basis: capture_to_ledger_write"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stdout.lines().next().unwrap_or_default(),
+        "kind,stream,frame,wall_us,wall_iso,t_capture_us,t_capture_iso,event,msg,changed_tiles,focus,lineage_mask,verdict_latency_ms,embeds_this_frame,energy_before,energy_after",
+        "the pinned header is unchanged: {stdout}"
+    );
+    assert!(
+        !stdout.contains("basis"),
+        "the note stays off stdout: {stdout}"
+    );
+}

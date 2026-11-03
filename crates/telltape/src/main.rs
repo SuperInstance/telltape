@@ -177,6 +177,18 @@ fn run_export_cli(args: &[String]) -> ! {
             std::process::exit(1);
         }
     };
+    // For CSV the latency basis has no metadata home either:
+    // the header is a pinned format, so the column's basis is
+    // stated on stderr, where the malformed note already lives
+    // (playtest-2 S5 — a bare 147,566 in the column reads as
+    // verdict computation time; on footage it is processing
+    // lag). Stdout stays pure CSV either way.
+    if format == ExportFormat::Csv {
+        eprintln!(
+            "telltape export: note: verdict_latency_ms basis: {} (what the number measures depends on the source kind — see docs/LEDGER-FORMAT.md)",
+            report.verdict_latency_basis
+        );
+    }
     // For CSV the malformed count has no metadata home in the
     // document, so it is reported on stderr — counted, never
     // silently dropped. (JSON carries it in its metadata.)
