@@ -57,7 +57,7 @@ without their label.
   Source: origin `docs/RESULTS.md` (wave-3 rows),
   `experiments/wave3/`.
 
-## E3 — The live 48-hour soak, IN PROGRESS — including the frozen feed (2026-11-01 → )
+## E3 — The live 48-hour soak, COMPLETE — including two frozen feeds (2026-11-01 → 2026-11-03)
 
 - **Pointed at:** a real room, via a laptop webcam dialling OUT
   to the Thor (the Windows Firewall drops unsolicited inbound;
@@ -65,23 +65,33 @@ without their label.
   polls through its ordinary `shot` source). Gate calibrated
   on the still night room first: 1,200 frames, nominations
   only on the baseline frame, **0 events, spend ratio 0.0008**.
-- **Produced (so far):** the soak started 2026-11-01 18:18
-  AKST and completes 2026-11-03 18:18 AKST; the verdict is due
-  after. It live-detected the homeowner arriving at the desk
-  that evening (events 43 → 48 as he crossed the frame and
-  sat; the gate then reabsorbed seated-him into the baseline).
-  At the last full check the ledger was still advancing and
-  events were in the hundreds.
-- **The failure, in the record on purpose:** on 2026-11-02 the
-  owner noticed the camera light was off. The Thor side was
-  alive and counting — but the feed was **frozen**: two
-  `/shot.jpg` grabs 10 s apart were byte-identical, the camera
-  pusher (a foreground window) had died, and the watch had
-  spent ~13 h (2026-11-01 ≈21:05 → 2026-11-02 ≈10:03 AKST)
-  re-polling the receiver's last frame and counting polls as
-  frames. The owner relaunched the pusher; live frames and
-  events resumed within minutes (393 → 415). The soak's end
-  time does not move; the verdict must fence the gap.
+- **Produced:** the soak ran 2026-11-01 18:18 AKST →
+  2026-11-03 18:18 AKST. It live-detected the homeowner
+  arriving at the desk the first evening (events 43 → 48 as he
+  crossed the frame and sat; the gate then reabsorbed
+  seated-him into the baseline). Final verdict (2026-11-03):
+  **1,675 events** published over **26.4 genuinely live
+  hours**; embed spend 20,127 s against 454,533 s for
+  embed-everything — a ratio of **0.0443**, against a ≤0.60
+  acceptance ceiling (PASS). The watcher process itself ran
+  the full 48 h without a failure (PASS). Precision's human
+  half is **unjudged** — no corrections were ever filed, so
+  the record says so rather than claiming a figure.
+  Calibration did not age: median background surprise on
+  steady scenes moved 0.0817 → 0.0671 across the live windows
+  at an untouched 0.2500 threshold.
+- **The failures, in the record on purpose:** the feed froze
+  **twice**, for 21.6 of the 48 hours in total. First, on
+  2026-11-02 the owner noticed the camera light was off: the
+  camera pusher (a foreground window) had died at ≈21:08 on
+  2026-11-01, and the watch spent 12.5 h re-polling the
+  receiver's last frame and counting polls as frames. The
+  owner relaunched the pusher; live frames and events resumed
+  within minutes (393 → 415). Second, the laptop was rebooted
+  on the final morning (2026-11-03 ≈09:07 AKST) and the
+  pusher was not restarted, so the last 9.2 h were frozen as
+  well. The verdict fences both gaps and reports live and
+  frozen time separately; the soak's end time never moved.
 - **Limit it exposed — and its fix, which ships in this
   repo:** `frames_seen` counted polls, not fresh images. That
   defect was gap G1 in the extraction plan; it is closed here:
@@ -91,8 +101,8 @@ without their label.
   regression test (P6). A tool whose product is trustworthy
   silence was caught manufacturing it; the example ships with
   the tool because that is the standard the tool is held to.
-  Source: origin `slice1/PROART-CAMERA.md`; incident recorded
-  2026-11-02, verdict pending at the time of writing.
+  Source: origin `slice1/PROART-CAMERA.md` (SOAK-VERDICT
+  section, collected 2026-11-03 from the Thor ledger).
 
 ## E4 — A conversation *about* the ledger: presence from the chair (2026-11-02)
 
