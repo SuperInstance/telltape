@@ -246,6 +246,63 @@ on the way out, when an embedder call fails mid-run
 the service receipts it as the `embedder_error` service row
 above before the stream ends.
 
+## The score series (sidecar, since v0.4.0)
+
+Not a ledger file: an optional analysis sidecar, written
+only when the run's config sets `score_series_path` (or
+`--score-series <path>` is passed). The ledger's design is
+that silence is the default — a frame that publishes
+nothing leaves no verdict row — which means the ledger
+alone cannot answer questions about a run's *sub-threshold*
+life: how close quiet frames came, and in what order their
+scores climbed. The series records that life. It is a pure
+observer: enabling it changes no ledger file, no verdict,
+and no spend (the scores already exist inside the gate; the
+series writes them down).
+
+One JSON object per frame the gate evaluates, in frame
+order, at the path the operator chose:
+
+```json
+{"frame":N,"t_capture_us":N,"gate_diff_max":F|null,"max_smoothed":F|null,"near_miss":B,"fired":B,"embedder":"name@version","tiles":[F|null,...]}
+```
+
+- `frame` / `t_capture_us` — the frame's index and capture
+  time, on the same clock basis as the verdict rows, so
+  the series joins the ledger without translation.
+- `gate_diff_max` — the largest per-tile driver diff (the
+  ingest gate's mean-abs pixel diff) among the frame's
+  tiles; `null` when no tile carried one.
+- `max_smoothed` — the frame's best tile smoothed score:
+  the same value the ledger folds into state.txt's
+  `max_smoothed_score` ceiling. `null` on a frame where no
+  tile has a score yet (a baseline frame).
+- `near_miss` — the frame published nothing and its best
+  score reached the near-miss band (>= 80% of the
+  threshold): the identical test behind state.txt's
+  `near_miss_frames` counter, per frame.
+- `fired` — the frame published a verdict (its row is
+  also in events.jsonl; the series is the superset).
+- `embedder` — the run's embedder identity, stamped on
+  every row: scores are comparable only within one
+  embedder's geometry, so the series carries its identity
+  with it.
+- `tiles` — every tile's smoothed score in tile order
+  (`null` where a tile has none yet).
+
+Scores carry 4 decimal places, the precision state.txt
+uses for the same quantities. The file is created fresh
+for each run (a series is one run's evidence) and grows at
+roughly 17 MB per 100k frames at the default 4x4 grid —
+about 50 MB for a day at a 2 fps watch. Writes are
+buffered; a killed run can lose a bounded tail (at most
+128 rows). Rows begin at the first frame the gate
+evaluates — the first frame carrying embeddings; earlier
+frames have no scores to record. `query` and `export` do
+not read the series: it is an offline analysis input (the
+CfC anticipation grading is its first consumer), not part
+of the ledger's contract.
+
 ## Reading a ledger with shelf tools
 
 `query` is the ledger reader (`telltape query <ledger-dir>

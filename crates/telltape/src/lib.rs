@@ -27,4 +27,5 @@ pub mod index;
 pub mod ledger;
 pub mod live;
 pub mod query;
+pub mod score_series;
 pub mod service;

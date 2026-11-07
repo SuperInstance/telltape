@@ -281,7 +281,7 @@ fn main() {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: telltape watch --config <file> [--recalibrate]\n       telltape index <footage> --config <file> [--fps N] [--recalibrate]\n       telltape query <ledger-dir> [--since T] [--until T] [--tile N] [--stream ID] [--summary]\n       telltape export <ledger-dir> [--format json|csv] [--out FILE] [--since T] [--until T] [--tile N] [--stream ID]\n       (--recalibrate acknowledges an embedder swap against an existing ledger)"
+                    "usage: telltape watch --config <file> [--recalibrate] [--score-series <path>]\n       telltape index <footage> --config <file> [--fps N] [--recalibrate] [--score-series <path>]\n       telltape query <ledger-dir> [--since T] [--until T] [--tile N] [--stream ID] [--summary]\n       telltape export <ledger-dir> [--format json|csv] [--out FILE] [--since T] [--until T] [--tile N] [--stream ID]\n       (--recalibrate acknowledges an embedder swap against an existing ledger;\n        --score-series writes one score row per evaluated frame to a JSONL sidecar — see docs/CONFIG.md)"
                 );
                 std::process::exit(0);
             }
@@ -293,7 +293,7 @@ fn main() {
             // `telltape --config f` means watch.)
             _ if !first.starts_with('-') => {
                 eprintln!(
-                    "telltape: unknown verb {first:?} — the verbs are watch, index, query, export\nusage: telltape watch --config <file> [--recalibrate]\n       telltape index <footage> --config <file> [--fps N] [--recalibrate]\n       telltape query <ledger-dir> [--since T] [--until T] [--tile N] [--stream ID] [--summary]\n       telltape export <ledger-dir> [--format json|csv] [--out FILE] [--since T] [--until T] [--tile N] [--stream ID]"
+                    "telltape: unknown verb {first:?} — the verbs are watch, index, query, export\nusage: telltape watch --config <file> [--recalibrate] [--score-series <path>]\n       telltape index <footage> --config <file> [--fps N] [--recalibrate] [--score-series <path>]\n       telltape query <ledger-dir> [--since T] [--until T] [--tile N] [--stream ID] [--summary]\n       telltape export <ledger-dir> [--format json|csv] [--out FILE] [--since T] [--until T] [--tile N] [--stream ID]"
                 );
                 std::process::exit(2);
             }
@@ -310,6 +310,19 @@ fn main() {
     if recalibrate_flag {
         cfg.recalibrate = true;
     }
+    // --score-series <path>: the v0.4.0 sidecar, as a CLI
+    // override of the config key (same option, two surfaces,
+    // like --recalibrate). A flag with no value after it is a
+    // usage error, not a silently disabled instrument.
+    if args.iter().any(|a| a == "--score-series") {
+        match arg_value(&args, "--score-series") {
+            Some(p) => cfg.score_series_path = p.to_string(),
+            None => {
+                eprintln!("telltape: --score-series needs a path");
+                std::process::exit(2);
+            }
+        }
+    }
     if verb == "index" {
         if let Some(fps) = arg_value(&args, "--fps") {
             match fps.parse::<f64>() {
@@ -325,7 +338,7 @@ fn main() {
         let mut source = None;
         let mut it = args.iter();
         while let Some(a) = it.next() {
-            if a == "--config" || a == "--fps" {
+            if a == "--config" || a == "--fps" || a == "--score-series" {
                 it.next();
             } else if !a.starts_with('-') && source.is_none() {
                 source = Some(a.clone());

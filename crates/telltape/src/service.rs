@@ -439,6 +439,19 @@ pub fn run(cfg: &Config) -> Result<Summary, ServiceError> {
         grid,
         &configured_identity,
     )?;
+    // Score series (v0.4.0): enable the sidecar before the
+    // first frame, so an unwritable path fails the run at
+    // startup — never after a day of unrecorded frames. The
+    // ledger's own files are untouched by the feature; the
+    // enable is announced on stderr only, like the source's
+    // frozen/recovered transitions.
+    if !cfg.score_series_path.is_empty() {
+        ledger.enable_score_series(&cfg.score_series_path)?;
+        eprintln!(
+            "[telltape] score series sidecar enabled: {}",
+            cfg.score_series_path
+        );
+    }
     // Footage mode (playtest F3) and the time anchor (F8). The
     // ingest stamps the anchor it actually used on every
     // frame_end; until the first stamp arrives a footage ledger

@@ -16,6 +16,7 @@ absent key is a documented choice, not a mystery.
 | `ledger_dir` | `ledger` | Directory holding `lens.txt` / `state.txt` / `events.jsonl` / `health.txt`. |
 | `ingest_cmd` | *(empty)* | Shell command producing ingest records on stdout (normally the Python ingest). Empty = the service reads records from its own stdin (tests, manual driving). |
 | `stop_file` | *(empty)* | Checked once per frame; if the file appears, the run shuts down cleanly. Empty = no stop file. |
+| `score_series_path` | *(empty)* | Path of the score-series sidecar: one JSONL row per frame the gate evaluates — its best smoothed score, near-miss and fired flags, and every tile's smoothed score — for offline analyses that need the sub-threshold life of a run (see "The score series" in [LEDGER-FORMAT.md](LEDGER-FORMAT.md)). Empty = no sidecar, and the ledger is byte-identical to a run without the feature. The file is created fresh for the run and grows at roughly 17 MB per 100k frames at the default grid (~50 MB/day at 2 fps). Also settable as `--score-series <path>` on the command line, which wins over the config key. |
 | `max_frames` | `0` | Stop after this many frames. `0` = unlimited. |
 | `soak` | `false` | Soak mode: run unattended to the stop file / EOF, appending precision self-report placeholders to `state.txt`. |
 

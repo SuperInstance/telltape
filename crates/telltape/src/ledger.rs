@@ -211,6 +211,15 @@ pub struct Ledger {
     /// and never withdraws meaning from its silence. Stamped
     /// into lens.txt as `source_kind`.
     pub footage: bool,
+    /// The score-series sidecar (v0.4.0), when the operator
+    /// enabled one: a pure observer tap fed from
+    /// [`Ledger::record_frame`] with the same values the
+    /// ledger itself folds into its ceiling and near-miss
+    /// accounting. `None` — the default, and every run that
+    /// does not ask for the series — writes nothing anywhere
+    /// new: the ledger's files are byte-identical to a run
+    /// without the feature.
+    pub score_series: Option<crate::score_series::ScoreSeries>,
     /// How this ledger's capture times are anchored to the
     /// epoch (playtest F8): `capture_clock` for live sources
     /// (frames stamped as they arrive); for indexed footage,
@@ -286,6 +295,7 @@ impl Ledger {
             gate_diff: None,
             grid,
             embedder_identity: embedder_identity.to_string(),
+            score_series: None,
             footage: false,
             time_anchor: "capture_clock".to_string(),
         };
@@ -295,6 +305,22 @@ impl Ledger {
 
     fn path(&self, name: &str) -> String {
         format!("{}/{name}", self.dir)
+    }
+
+    /// Enable the score-series sidecar at `path`, stamped
+    /// with this ledger's embedder identity. Called by the
+    /// service when the config names a path; an unwritable
+    /// path fails here, at startup, rather than after a day
+    /// of silently unrecorded frames. The file is created
+    /// (truncated) for this run: a series is one run's
+    /// evidence, and appending a second run's frames to it
+    /// would corrupt the frame indexing both runs claim.
+    pub fn enable_score_series(&mut self, path: &str) -> std::io::Result<()> {
+        self.score_series = Some(crate::score_series::ScoreSeries::open(
+            path,
+            &self.embedder_identity,
+        )?);
+        Ok(())
     }
 
     pub fn service_event(&mut self, kind: &str, msg: &str) -> std::io::Result<()> {
@@ -351,11 +377,50 @@ impl Ledger {
             .iter()
             .filter_map(|tv| tv.smoothed_score)
             .fold(f64::NEG_INFINITY, f64::max);
-        if frame_best.is_finite() {
-            s.max_smoothed_score = s.max_smoothed_score.max(frame_best);
-            if !out.verdict.changed && frame_best >= 0.8 * self.threshold {
+        let frame_best = if frame_best.is_finite() {
+            Some(frame_best)
+        } else {
+            None
+        };
+        let near_miss = frame_best
+            .map(|b| !out.verdict.changed && b >= 0.8 * self.threshold)
+            .unwrap_or(false);
+        if let Some(b) = frame_best {
+            s.max_smoothed_score = s.max_smoothed_score.max(b);
+            if near_miss {
                 s.near_miss_frames += 1;
             }
+        }
+
+        // Score series (v0.4.0): when the operator enabled the
+        // sidecar, this frame's row is written from the values
+        // just folded into the counters above — the same
+        // frame_best, the same near-miss test — so the series
+        // cannot drift from the ledger's own accounting. A
+        // write failure aborts the run like any other ledger
+        // write failure: an instrument that cannot record must
+        // not keep stamping.
+        if let Some(series) = self.score_series.as_mut() {
+            let gate_diff_max = out
+                .tiles
+                .iter()
+                .filter_map(|tv| tv.driver_diff)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let gate_diff_max = if gate_diff_max.is_finite() {
+                Some(gate_diff_max)
+            } else {
+                None
+            };
+            let tiles: Vec<Option<f64>> = out.tiles.iter().map(|tv| tv.smoothed_score).collect();
+            series.record(
+                out.verdict.frame,
+                t_capture_us,
+                gate_diff_max,
+                frame_best,
+                near_miss,
+                out.verdict.changed,
+                &tiles,
+            )?;
         }
 
         let mut latency_ms = None;

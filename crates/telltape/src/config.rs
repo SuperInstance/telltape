@@ -90,6 +90,18 @@ pub struct Config {
     pub max_frames: u32,
     /// Checked once per frame; if it appears, shut down cleanly.
     pub stop_file: String,
+    /// Path of the score-series sidecar (v0.4.0): one JSONL
+    /// row per frame the gate evaluates — its best smoothed
+    /// score, near-miss and fired flags, and every tile's
+    /// smoothed score — for offline analyses that need the
+    /// sub-threshold life of a run (the CfC anticipation
+    /// grading is the first consumer; see
+    /// `src/score_series.rs` for the schema). **Empty (the
+    /// default) = no sidecar**: the ledger's files are
+    /// byte-identical to a run without the feature. The file
+    /// is created fresh for the run and grows at roughly
+    /// 17 MB per 100k frames at the default 4x4 grid.
+    pub score_series_path: String,
     /// Expected embedding width of the configured embedder
     /// (default 1280, the I-JEPA width). Used by `index` when it
     /// composes its ingest command.
@@ -149,6 +161,7 @@ impl Default for Config {
             soak: false,
             max_frames: 0,
             stop_file: String::new(),
+            score_series_path: String::new(),
             embed_dim: 1280,
             embed_field: "file".into(),
             embed_key: "embedding".into(),
@@ -286,6 +299,9 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
     }
     if let Some(v) = get1("stop_file") {
         cfg.stop_file = v;
+    }
+    if let Some(v) = get1("score_series_path") {
+        cfg.score_series_path = v;
     }
     if let Some(v) = get1("embed_field") {
         cfg.embed_field = v;
@@ -476,6 +492,16 @@ mod tests {
                 .unwrap()
                 .source_footage
         );
+    }
+
+    #[test]
+    fn score_series_path_parses_and_defaults_off() {
+        // Off by default: no sidecar, and the run is a run
+        // without the feature.
+        let c = parse_config("").unwrap();
+        assert!(c.score_series_path.is_empty());
+        let c = parse_config("score_series_path = /tmp/series.jsonl\n").unwrap();
+        assert_eq!(c.score_series_path, "/tmp/series.jsonl");
     }
 
     #[test]

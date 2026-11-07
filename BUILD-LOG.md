@@ -956,3 +956,69 @@ the probe passing.
 **Version**: all three workspace crates 0.3.1 → 0.3.2;
 tagged v0.3.2 locally. Not pushed — publication stays the
 gated step, as before.
+
+## The score-series sidecar (2026-11-06, v0.4.0)
+
+The instrument change VALIDATION-VERDICT-1 §6 scoped as
+the CfC unblock. The validation run's ledger held per-tile
+scores only for the 2,243 frames that fired; its 117,292
+near-miss frames survived as a counter, so the
+sub-threshold run-in a CfC anticipation test grades —
+scores climbing toward an event in the frames *before* it
+fires — was unrecorded for quiet frames. The scores exist
+inside the gate on every frame; they were simply never
+written down.
+
+**What shipped.** `telltape watch` (and `index`, which
+shares the loop) can now write a score-series sidecar:
+one compact JSONL row per frame the gate evaluates —
+frame, capture time, gate-diff summary, the frame's best
+smoothed score, near-miss and fired flags, the embedder
+identity, and every tile's smoothed score. Set
+`score_series_path` in the config or pass
+`--score-series <path>`; empty (the default) is no
+sidecar. The writer is a pure observer tap at the one
+seam where the ledger itself reads those values
+(`Ledger::record_frame`'s ceiling/near-miss accounting),
+so a row cannot disagree with the ledger's own counters.
+No scoring, gating, freshness, or collapse-watch code is
+touched. An unwritable path fails the run at startup,
+never after a day of unrecorded frames. The schema, size
+behaviour (~17 MB per 100k frames at 4x4), and bounded
+tail-loss contract are documented in
+docs/LEDGER-FORMAT.md ("The score series") and
+docs/CONFIG.md.
+
+**Numbers.** Suite: 163 → **168 passed + 1 ignored**
+(+1 config-parse unit test, +2 writer unit tests, +2
+integration tests). The integration pair: (1) a service
+run over the synthetic fixture with the sidecar on vs
+off — sidecar holds exactly one row per processed frame
+in frame order with only the cut frame flagged fired,
+and events.jsonl / state.txt are identical across the
+two runs once clock-derived fields (wall times, verdict
+latency, stage timings) are normalised; (2) a synthetic
+run-in — every tile's embedding rotating by a growing
+step so the score climbs 0.021, 0.042, ... 0.231 through
+the near-miss band without ever firing — where the
+ledger publishes zero verdicts and the sidecar records
+all twelve frames with the gate's own values (each row's
+max checked against the pipeline's reported max to the
+row's 4-decimal precision), the near-miss flags landing
+exactly on the two band frames. Staged acceptance
+re-run in all three modes (off, config key, CLI flag):
+**18 frames, 34 embeds, 2 events, frame 4 = 16/16,
+frame 7 = {5, 6}, spend 0.1181 — PASS**, exact, every
+mode; the sidecar holds 18 rows in both enabled modes,
+and a field-level diff of events.jsonl across modes
+shows only the five timing fields differing (the
+ingest's re-stamped replay clock, wall times, latencies,
+stage timings) — every score, tile, and count
+bit-identical. `clippy --all-targets -D warnings` and
+`cargo fmt --check` clean.
+
+**Version**: all three workspace crates 0.3.2 → 0.4.0.
+Not tagged, not pushed — publication stays the gated
+step, as before. The CfC anticipation question is now
+gradeable on any future run that enables the sidecar;
+grading it is a separate job against such a run.

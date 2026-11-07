@@ -1,6 +1,6 @@
 [package]
 name = "rolling-substrate-core"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Honest Rust substrate from the Rolling Perception email: lock-free ring, real sheaf smoothing, fixed lineage, ROI gating. Dependency-free (std only)."
